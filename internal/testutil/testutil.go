@@ -16,8 +16,8 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/timeutil"
+	"github.com/nebinfra/asynq/internal/base"
+	"github.com/nebinfra/asynq/internal/timeutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -214,6 +214,10 @@ func FlushDB(tb testing.TB, r redis.UniversalClient) {
 func SeedPendingQueue(tb testing.TB, r redis.UniversalClient, msgs []*base.TaskMessage, qname string) {
 	tb.Helper()
 	r.SAdd(context.Background(), base.AllQueues, qname)
+	if qname == base.DefaultQueueName {
+		seedRedisOrderedSet(tb, r, base.PendingKey(qname), msgs, base.TaskStatePending)
+		return
+	}
 	seedRedisList(tb, r, base.PendingKey(qname), msgs, base.TaskStatePending)
 }
 
@@ -221,6 +225,10 @@ func SeedPendingQueue(tb testing.TB, r redis.UniversalClient, msgs []*base.TaskM
 func SeedActiveQueue(tb testing.TB, r redis.UniversalClient, msgs []*base.TaskMessage, qname string) {
 	tb.Helper()
 	r.SAdd(context.Background(), base.AllQueues, qname)
+	if qname == base.DefaultQueueName {
+		seedRedisOrderedSet(tb, r, base.ActiveKey(qname), msgs, base.TaskStateActive)
+		return
+	}
 	seedRedisList(tb, r, base.ActiveKey(qname), msgs, base.TaskStateActive)
 }
 
@@ -400,10 +408,39 @@ func seedRedisZSet(tb testing.TB, c redis.UniversalClient, key string,
 	}
 }
 
+func seedRedisOrderedSet(tb testing.TB, c redis.UniversalClient, key string,
+	msgs []*base.TaskMessage, state base.TaskState) {
+	tb.Helper()
+	for score, msg := range msgs {
+		encoded := MustMarshal(tb, msg)
+		if err := c.ZAdd(context.Background(), key, redis.Z{Member: msg.ID, Score: float64(score)}).Err(); err != nil {
+			tb.Fatal(err)
+		}
+		taskKey := base.TaskKey(msg.Queue, msg.ID)
+		data := map[string]interface{}{
+			"msg":        encoded,
+			"state":      state.String(),
+			"unique_key": msg.UniqueKey,
+			"group":      msg.GroupKey,
+		}
+		if err := c.HSet(context.Background(), taskKey, data).Err(); err != nil {
+			tb.Fatal(err)
+		}
+		if len(msg.UniqueKey) > 0 {
+			if err := c.SetNX(context.Background(), msg.UniqueKey, msg.ID, time.Minute).Err(); err != nil {
+				tb.Fatalf("Failed to set unique lock in redis: %v", err)
+			}
+		}
+	}
+}
+
 // GetPendingMessages returns all pending messages in the given queue.
 // It also asserts the state field of the task.
 func GetPendingMessages(tb testing.TB, r redis.UniversalClient, qname string) []*base.TaskMessage {
 	tb.Helper()
+	if qname == base.DefaultQueueName {
+		return getMessagesFromZSet(tb, r, qname, base.PendingKey, base.TaskStatePending)
+	}
 	return getMessagesFromList(tb, r, qname, base.PendingKey, base.TaskStatePending)
 }
 
@@ -411,6 +448,9 @@ func GetPendingMessages(tb testing.TB, r redis.UniversalClient, qname string) []
 // It also asserts the state field of the task.
 func GetActiveMessages(tb testing.TB, r redis.UniversalClient, qname string) []*base.TaskMessage {
 	tb.Helper()
+	if qname == base.DefaultQueueName {
+		return getMessagesFromZSet(tb, r, qname, base.ActiveKey, base.TaskStateActive)
+	}
 	return getMessagesFromList(tb, r, qname, base.ActiveKey, base.TaskStateActive)
 }
 
@@ -607,7 +647,13 @@ func SeedRedisLists(tb testing.TB, r redis.UniversalClient, lists map[string][]s
 
 func AssertRedisLists(t *testing.T, r redis.UniversalClient, wantLists map[string][]string) {
 	for key, want := range wantLists {
-		got, err := r.LRange(context.Background(), key, 0, -1).Result()
+		var got []string
+		var err error
+		if r.Type(context.Background(), key).Val() == "zset" {
+			got, err = r.ZRange(context.Background(), key, 0, -1).Result()
+		} else {
+			got, err = r.LRange(context.Background(), key, 0, -1).Result()
+		}
 		if err != nil {
 			t.Fatalf("Failed to read list (key=%q): %v", key, err)
 		}

@@ -15,10 +15,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/uuid"
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/rdb"
-	h "github.com/hibiken/asynq/internal/testutil"
-	"github.com/hibiken/asynq/internal/timeutil"
+	"github.com/nebinfra/asynq/internal/base"
+	"github.com/nebinfra/asynq/internal/rdb"
+	h "github.com/nebinfra/asynq/internal/testutil"
+	"github.com/nebinfra/asynq/internal/timeutil"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -402,7 +402,12 @@ func TestInspectorGetQueueInfo(t *testing.T) {
 			if enqueueTime.IsZero() {
 				continue
 			}
-			oldestPendingMessageID := r.LRange(ctx, base.PendingKey(qname), -1, -1).Val()[0] // get the right most msg in the list
+			var oldestPendingMessageID string
+			if qname == base.DefaultQueueName {
+				oldestPendingMessageID = r.ZRange(ctx, base.PendingKey(qname), 0, 0).Val()[0]
+			} else {
+				oldestPendingMessageID = r.LRange(ctx, base.PendingKey(qname), -1, -1).Val()[0]
+			}
 			r.HSet(ctx, base.TaskKey(qname, oldestPendingMessageID), "pending_since", enqueueTime.UnixNano())
 		}
 

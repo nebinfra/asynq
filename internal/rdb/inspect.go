@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/errors"
+	"github.com/nebinfra/asynq/internal/base"
+	"github.com/nebinfra/asynq/internal/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cast"
 )
@@ -94,11 +94,17 @@ type DailyStats struct {
 // ARGV[2] -> group key prefix
 var currentStatsCmd = redis.NewScript(`
 local res = {}
-local pendingTaskCount = redis.call("LLEN", KEYS[1])
+local function queue_count(key)
+	if redis.call("TYPE", key).ok == "zset" then
+		return redis.call("ZCARD", key)
+	end
+	return redis.call("LLEN", key)
+end
+local pendingTaskCount = queue_count(KEYS[1])
 table.insert(res, KEYS[1])
 table.insert(res, pendingTaskCount)
 table.insert(res, KEYS[2])
-table.insert(res, redis.call("LLEN", KEYS[2]))
+table.insert(res, queue_count(KEYS[2]))
 table.insert(res, KEYS[3])
 table.insert(res, redis.call("ZCARD", KEYS[3]))
 table.insert(res, KEYS[4])
@@ -120,7 +126,12 @@ table.insert(res, KEYS[11])
 table.insert(res, redis.call("EXISTS", KEYS[11]))
 table.insert(res, "oldest_pending_since")
 if pendingTaskCount > 0 then
-	local id = redis.call("LRANGE", KEYS[1], -1, -1)[1]
+	local id
+	if redis.call("TYPE", KEYS[1]).ok == "zset" then
+		id = redis.call("ZRANGE", KEYS[1], 0, 0)[1]
+	else
+		id = redis.call("LRANGE", KEYS[1], -1, -1)[1]
+	end
 	table.insert(res, redis.call("HGET", ARGV[1] .. id, "pending_since"))
 else
 	table.insert(res, 0)
@@ -259,14 +270,25 @@ if sample_size <= 0 then
 end
 local memusg = 0
 for i=1,2 do
-    local ids = redis.call("LRANGE", KEYS[i], 0, sample_size - 1)
+    local ids
+    local ordered = redis.call("TYPE", KEYS[i]).ok == "zset"
+    if ordered then
+        ids = redis.call("ZRANGE", KEYS[i], 0, sample_size - 1)
+    else
+        ids = redis.call("LRANGE", KEYS[i], 0, sample_size - 1)
+    end
     local sample_total = 0
     if (table.getn(ids) > 0) then
         for _, id in ipairs(ids) do
             local bytes = redis.call("MEMORY", "USAGE", ARGV[1] .. id)
             sample_total = sample_total + bytes
         end
-        local n = redis.call("LLEN", KEYS[i])
+        local n
+        if ordered then
+            n = redis.call("ZCARD", KEYS[i])
+        else
+            n = redis.call("LLEN", KEYS[i])
+        end
         local avg = sample_total / table.getn(ids)
         memusg = memusg + (avg * n)
     end
@@ -665,6 +687,18 @@ end
 return data
 `)
 
+var listOrderedMessagesCmd = redis.NewScript(`
+local ids = redis.call("ZRANGE", KEYS[1], ARGV[1], ARGV[2])
+local data = {}
+for _, id in ipairs(ids) do
+	local key = ARGV[3] .. id
+	local msg, result = unpack(redis.call("HMGET", key, "msg","result"))
+	table.insert(data, msg)
+	table.insert(data, result)
+end
+return data
+`)
+
 // listMessages returns a list of TaskInfo in Redis list with the given key.
 func (r *RDB) listMessages(qname string, state base.TaskState, pgn Pagination) ([]*base.TaskInfo, error) {
 	var key string
@@ -676,11 +710,14 @@ func (r *RDB) listMessages(qname string, state base.TaskState, pgn Pagination) (
 	default:
 		panic(fmt.Sprintf("unsupported task state: %v", state))
 	}
-	// Note: Because we use LPUSH to redis list, we need to calculate the
-	// correct range and reverse the list to get the tasks with pagination.
-	stop := -pgn.start() - 1
-	start := -pgn.stop() - 1
-	res, err := listMessagesCmd.Run(context.Background(), r.client,
+	start, stop := -pgn.stop()-1, -pgn.start()-1
+	script := listMessagesCmd
+	ordered := qname == base.DefaultQueueName
+	if ordered {
+		start, stop = pgn.start(), pgn.stop()
+		script = listOrderedMessagesCmd
+	}
+	res, err := script.Run(context.Background(), r.client,
 		[]string{key}, start, stop, base.TaskKeyPrefix(qname)).Result()
 	if err != nil {
 		return nil, errors.E(errors.Unknown, err)
@@ -710,7 +747,9 @@ func (r *RDB) listMessages(qname string, state base.TaskState, pgn Pagination) (
 			Result:        res,
 		})
 	}
-	reverse(infos)
+	if !ordered {
+		reverse(infos)
+	}
 	return infos, nil
 
 }
@@ -962,7 +1001,12 @@ func (r *RDB) RunAllAggregatingTasks(qname, gname string) (int64, error) {
 		base.TaskKeyPrefix(qname),
 		gname,
 	}
-	res, err := runAllAggregatingCmd.Run(context.Background(), r.client, keys, argv...).Result()
+	script := runAllAggregatingCmd
+	if qname == base.DefaultQueueName {
+		script = receiverTargetRunAllAggregatingCmd
+		argv = append(argv, receiverTargetMaximumQueueScore)
+	}
+	res, err := script.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return 0, errors.E(op, errors.Internal, err)
 	}
@@ -1040,7 +1084,12 @@ func (r *RDB) RunTask(qname, id string) error {
 		base.QueueKeyPrefix(qname),
 		base.GroupKeyPrefix(qname),
 	}
-	res, err := runTaskCmd.Run(context.Background(), r.client, keys, argv...).Result()
+	script := runTaskCmd
+	if qname == base.DefaultQueueName {
+		script = receiverTargetRunTaskCmd
+		argv = append(argv, receiverTargetMaximumQueueScore)
+	}
+	res, err := script.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return errors.E(op, errors.Unknown, err)
 	}
@@ -1093,7 +1142,12 @@ func (r *RDB) runAll(zset, qname string) (int64, error) {
 	argv := []interface{}{
 		base.TaskKeyPrefix(qname),
 	}
-	res, err := runAllCmd.Run(context.Background(), r.client, keys, argv...).Result()
+	script := runAllCmd
+	if qname == base.DefaultQueueName {
+		script = receiverTargetRunAllCmd
+		argv = append(argv, receiverTargetMaximumQueueScore)
+	}
+	res, err := script.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -1212,7 +1266,12 @@ func (r *RDB) ArchiveAllAggregatingTasks(qname, gname string) (int64, error) {
 // Output:
 // integer: Number of tasks archived
 var archiveAllPendingCmd = redis.NewScript(`
-local ids = redis.call("LRANGE", KEYS[1], 0, -1)
+local ids
+if redis.call("TYPE", KEYS[1]).ok == "zset" then
+	ids = redis.call("ZRANGE", KEYS[1], 0, -1)
+else
+	ids = redis.call("LRANGE", KEYS[1], 0, -1)
+end
 for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
 	redis.call("HSET", ARGV[4] .. id, "state", "archived")
@@ -1285,7 +1344,14 @@ if state == "archived" then
 	return -1
 end
 if state == "pending" then
-	if redis.call("LREM", ARGV[5] .. state, 1, ARGV[1]) == 0 then
+	local pending = ARGV[5] .. state
+	local removed
+	if redis.call("TYPE", pending).ok == "zset" then
+		removed = redis.call("ZREM", pending, ARGV[1])
+	else
+		removed = redis.call("LREM", pending, 1, ARGV[1])
+	end
+	if removed == 0 then
 		return redis.error_reply("task id not found in list " .. tostring(ARGV[5] .. state))
 	end
 elseif state == "aggregating" then
@@ -1521,7 +1587,14 @@ if state == "active" then
 	return -1
 end
 if state == "pending" then
-	if redis.call("LREM", ARGV[2] .. state, 0, ARGV[1]) == 0 then
+	local pending = ARGV[2] .. state
+	local removed
+	if redis.call("TYPE", pending).ok == "zset" then
+		removed = redis.call("ZREM", pending, ARGV[1])
+	else
+		removed = redis.call("LREM", pending, 0, ARGV[1])
+	end
+	if removed == 0 then
 		return redis.error_reply("task is not found in list: " .. tostring(ARGV[2] .. state))
 	end
 elseif state == "aggregating" then
@@ -1734,7 +1807,12 @@ func (r *RDB) DeleteAllAggregatingTasks(qname, gname string) (int64, error) {
 // Output:
 // integer: number of tasks deleted
 var deleteAllPendingCmd = redis.NewScript(`
-local ids = redis.call("LRANGE", KEYS[1], 0, -1)
+local ids
+if redis.call("TYPE", KEYS[1]).ok == "zset" then
+	ids = redis.call("ZRANGE", KEYS[1], 0, -1)
+else
+	ids = redis.call("LRANGE", KEYS[1], 0, -1)
+end
 for _, id in ipairs(ids) do
 	redis.call("DEL", ARGV[1] .. id)
 end
@@ -1784,29 +1862,20 @@ func (r *RDB) DeleteAllPendingTasks(qname string) (int64, error) {
 // Returns 1 if successfully removed.
 // Returns -2 if the queue has active tasks.
 var removeQueueForceCmd = redis.NewScript(`
-local active = redis.call("LLEN", KEYS[2])
+local function queue_members(key)
+	if redis.call("TYPE", key).ok == "zset" then
+		return redis.call("ZRANGE", key, 0, -1)
+	end
+	return redis.call("LRANGE", key, 0, -1)
+end
+local active = table.getn(queue_members(KEYS[2]))
 if active > 0 then
     return -2
 end
-for _, id in ipairs(redis.call("LRANGE", KEYS[1], 0, -1)) do
+for _, id in ipairs(queue_members(KEYS[1])) do
 	redis.call("DEL", ARGV[1] .. id)
 end
-for _, id in ipairs(redis.call("LRANGE", KEYS[2], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
-end
-for _, id in ipairs(redis.call("ZRANGE", KEYS[3], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
-end
-for _, id in ipairs(redis.call("ZRANGE", KEYS[4], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
-end
-for _, id in ipairs(redis.call("ZRANGE", KEYS[5], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
-end
-for _, id in ipairs(redis.call("LRANGE", KEYS[1], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
-end
-for _, id in ipairs(redis.call("LRANGE", KEYS[2], 0, -1)) do
+for _, id in ipairs(queue_members(KEYS[2])) do
 	redis.call("DEL", ARGV[1] .. id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[3], 0, -1)) do
@@ -1845,10 +1914,16 @@ return 1`)
 // Returns -1 if queue is not empty
 var removeQueueCmd = redis.NewScript(`
 local ids = {}
-for _, id in ipairs(redis.call("LRANGE", KEYS[1], 0, -1)) do
+local function queue_members(key)
+	if redis.call("TYPE", key).ok == "zset" then
+		return redis.call("ZRANGE", key, 0, -1)
+	end
+	return redis.call("LRANGE", key, 0, -1)
+end
+for _, id in ipairs(queue_members(KEYS[1])) do
 	table.insert(ids, id)
 end
-for _, id in ipairs(redis.call("LRANGE", KEYS[2], 0, -1)) do
+for _, id in ipairs(queue_members(KEYS[2])) do
 	table.insert(ids, id)
 end
 for _, id in ipairs(redis.call("ZRANGE", KEYS[3], 0, -1)) do

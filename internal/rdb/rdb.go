@@ -13,9 +13,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/errors"
-	"github.com/hibiken/asynq/internal/timeutil"
+	"github.com/nebinfra/asynq/internal/base"
+	"github.com/nebinfra/asynq/internal/errors"
+	"github.com/nebinfra/asynq/internal/timeutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cast"
 )
@@ -129,7 +129,12 @@ func (r *RDB) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 		msg.ID,
 		r.clock.Now().UnixNano(),
 	}
-	n, err := r.runScriptWithErrorCode(ctx, op, enqueueCmd, keys, argv...)
+	script := enqueueCmd
+	if msg.Queue == base.DefaultQueueName {
+		script = receiverTargetEnqueueCmd
+		argv = append(argv, receiverTargetMaximumQueueScore)
+	}
+	n, err := r.runScriptWithErrorCode(ctx, op, script, keys, argv...)
 	if err != nil {
 		return err
 	}
@@ -196,7 +201,12 @@ func (r *RDB) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time
 		encoded,
 		r.clock.Now().UnixNano(),
 	}
-	n, err := r.runScriptWithErrorCode(ctx, op, enqueueUniqueCmd, keys, argv...)
+	script := enqueueUniqueCmd
+	if msg.Queue == base.DefaultQueueName {
+		script = receiverTargetEnqueueUniqueCmd
+		argv = append(argv, receiverTargetMaximumQueueScore)
+	}
+	n, err := r.runScriptWithErrorCode(ctx, op, script, keys, argv...)
 	if err != nil {
 		return err
 	}
@@ -255,7 +265,12 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 			leaseExpirationTime.Unix(),
 			base.TaskKeyPrefix(qname),
 		}
-		res, err := dequeueCmd.Run(context.Background(), r.client, keys, argv...).Result()
+		script := dequeueCmd
+		if qname == base.DefaultQueueName {
+			script = receiverTargetDequeueCmd
+			argv = append(argv, receiverTargetMaximumQueueScore)
+		}
+		res, err := script.Run(context.Background(), r.client, keys, argv...).Result()
 		if err == redis.Nil {
 			continue
 		} else if err != nil {
@@ -283,7 +298,13 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 // ARGV[2] -> stats expiration timestamp
 // ARGV[3] -> max int64 value
 var doneCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
+local removed
+if redis.call("TYPE", KEYS[1]).ok == "zset" then
+  removed = redis.call("ZREM", KEYS[1], ARGV[1])
+else
+  removed = redis.call("LREM", KEYS[1], 0, ARGV[1])
+end
+if removed == 0 then
   return redis.error_reply("NOT FOUND")
 end
 if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
@@ -316,7 +337,13 @@ return redis.status_reply("OK")
 // ARGV[2] -> stats expiration timestamp
 // ARGV[3] -> max int64 value
 var doneUniqueCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
+local removed
+if redis.call("TYPE", KEYS[1]).ok == "zset" then
+  removed = redis.call("ZREM", KEYS[1], ARGV[1])
+else
+  removed = redis.call("LREM", KEYS[1], 0, ARGV[1])
+end
+if removed == 0 then
   return redis.error_reply("NOT FOUND")
 end
 if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
@@ -380,7 +407,13 @@ func (r *RDB) Done(ctx context.Context, msg *base.TaskMessage) error {
 // ARGV[4] -> task message data
 // ARGV[5] -> max int64 value
 var markAsCompleteCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
+local removed
+if redis.call("TYPE", KEYS[1]).ok == "zset" then
+  removed = redis.call("ZREM", KEYS[1], ARGV[1])
+else
+  removed = redis.call("LREM", KEYS[1], 0, ARGV[1])
+end
+if removed == 0 then
   return redis.error_reply("NOT FOUND")
 end
 if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
@@ -417,7 +450,13 @@ return redis.status_reply("OK")
 // ARGV[4] -> task message data
 // ARGV[5] -> max int64 value
 var markAsCompleteUniqueCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[1], 0, ARGV[1]) == 0 then
+local removed
+if redis.call("TYPE", KEYS[1]).ok == "zset" then
+  removed = redis.call("ZREM", KEYS[1], ARGV[1])
+else
+  removed = redis.call("LREM", KEYS[1], 0, ARGV[1])
+end
+if removed == 0 then
   return redis.error_reply("NOT FOUND")
 end
 if redis.call("ZREM", KEYS[2], ARGV[1]) == 0 then
@@ -502,6 +541,9 @@ func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 		base.LeaseKey(msg.Queue),
 		base.PendingKey(msg.Queue),
 		base.TaskKey(msg.Queue, msg.ID),
+	}
+	if msg.Queue == base.DefaultQueueName {
+		return r.runScript(ctx, op, receiverTargetRequeueCmd, keys, msg.ID, receiverTargetMaximumQueueScore)
 	}
 	return r.runScript(ctx, op, requeueCmd, keys, msg.ID)
 }
@@ -770,7 +812,13 @@ func (r *RDB) ScheduleUnique(ctx context.Context, msg *base.TaskMessage, process
 // ARGV[5] -> is_failure (bool)
 // ARGV[6] -> max int64 value
 var retryCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
+local removed
+if redis.call("TYPE", KEYS[2]).ok == "zset" then
+  removed = redis.call("ZREM", KEYS[2], ARGV[1])
+else
+  removed = redis.call("LREM", KEYS[2], 0, ARGV[1])
+end
+if removed == 0 then
   return redis.error_reply("NOT FOUND")
 end
 if redis.call("ZREM", KEYS[3], ARGV[1]) == 0 then
@@ -859,7 +907,13 @@ const (
 // ARGV[6] -> stats expiration timestamp
 // ARGV[7] -> max int64 value
 var archiveCmd = redis.NewScript(`
-if redis.call("LREM", KEYS[2], 0, ARGV[1]) == 0 then
+local removed
+if redis.call("TYPE", KEYS[2]).ok == "zset" then
+  removed = redis.call("ZREM", KEYS[2], ARGV[1])
+else
+  removed = redis.call("LREM", KEYS[2], 0, ARGV[1])
+end
+if removed == 0 then
   return redis.error_reply("NOT FOUND")
 end
 if redis.call("ZREM", KEYS[3], ARGV[1]) == 0 then
@@ -989,7 +1043,12 @@ func (r *RDB) forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix stri
 		now.UnixNano(),
 		groupKeyPrefix,
 	}
-	res, err := forwardCmd.Run(context.Background(), r.client, keys, argv...).Result()
+	script := forwardCmd
+	if pendingKey == base.DefaultQueue {
+		script = receiverTargetForwardCmd
+		argv = append(argv, receiverTargetMaximumQueueScore)
+	}
+	res, err := script.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return 0, errors.E(errors.Internal, fmt.Sprintf("redis eval error: %v", err))
 	}
