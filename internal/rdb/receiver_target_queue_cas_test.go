@@ -270,6 +270,12 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 	if count := r.client.HLen(t.Context(), keys[9]).Val(); count != 14 {
 		t.Fatalf("released source field count = %d, want 14", count)
 	}
+	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
+		t.Fatalf("replay released source: %v", err)
+	}
+	if fence := r.client.HGet(t.Context(), keys[9], "releaseFence").Val(); fence != "closed" {
+		t.Fatalf("replayed release fence = %q, want closed", fence)
+	}
 	if exists := r.client.Exists(t.Context(), keys[10]).Val(); exists != 0 {
 		t.Fatalf("released task exists: %d", exists)
 	}
