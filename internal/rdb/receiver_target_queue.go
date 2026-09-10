@@ -130,11 +130,11 @@ func (r *RDB) receiverTargetReleaseCommand(ctx context.Context, taskID string, i
 		return keys, operands, fmt.Errorf("invalid release receiver input")
 	}
 	sourceKey := "nebpilot:e:" + input.StateEpoch + ":receiver-target:queue-reservation:" + input.SourceIDDigest + ":" + taskID
-	source, err := r.receiverTargetFinalizedSource(ctx, sourceKey)
+	source, err := r.receiverTargetFinalizedSource(ctx, sourceKey, true)
 	if err != nil {
 		return keys, operands, err
 	}
-	if source.sourceIDDigest != input.SourceIDDigest || source.stateEpoch != input.StateEpoch || source.taskDigest != input.TaskDigest || source.releaseFence != "open" {
+	if source.sourceIDDigest != input.SourceIDDigest || source.stateEpoch != input.StateEpoch || source.taskDigest != input.TaskDigest || source.releaseFence != "open" && source.releaseFence != "closed" {
 		return keys, operands, fmt.Errorf("release source mismatch")
 	}
 	frame := receiverTargetSuccessorSourceID(source, input.EffectID, taskID)
@@ -175,7 +175,7 @@ func (r *RDB) receiverTargetRecoveryCommand(
 	if err != nil || sourceCount == 0 {
 		return keys, operands, err
 	}
-	source, err := r.receiverTargetFinalizedSource(ctx, keys[9])
+	source, err := r.receiverTargetFinalizedSource(ctx, keys[9], false)
 	if err != nil {
 		return keys, operands, err
 	}
@@ -440,7 +440,7 @@ func (r *RDB) receiverTargetNativeSnapshot(ctx context.Context, msg *base.TaskMe
 		return task, source, epoch, envelope, keys, fmt.Errorf("runtime epoch mismatch")
 	}
 	sourceKey := "nebpilot:e:" + taskValues[3] + ":receiver-target:queue-reservation:" + taskValues[2] + ":" + msg.ID
-	source, err = r.receiverTargetFinalizedSource(ctx, sourceKey)
+	source, err = r.receiverTargetFinalizedSource(ctx, sourceKey, false)
 	if err != nil {
 		return task, source, epoch, envelope, keys, err
 	}
@@ -456,7 +456,7 @@ func (r *RDB) receiverTargetNativeSnapshot(ctx context.Context, msg *base.TaskMe
 	return task, source, epoch, envelope, keys, nil
 }
 
-func (r *RDB) receiverTargetFinalizedSource(ctx context.Context, sourceKey string) (receiverTargetNativeSource, error) {
+func (r *RDB) receiverTargetFinalizedSource(ctx context.Context, sourceKey string, allowClosed bool) (receiverTargetNativeSource, error) {
 	var source receiverTargetNativeSource
 	sourceCount, err := r.client.HLen(ctx, sourceKey).Result()
 	if err != nil || sourceCount != 12 && sourceCount != 14 {
@@ -476,7 +476,7 @@ func (r *RDB) receiverTargetFinalizedSource(ctx context.Context, sourceKey strin
 		taskDigest: sourceValues[4], releaseFence: sourceValues[5], targetRevision: sourceValues[6], nativeExpiry: sourceValues[8],
 		ackReceipt: sourceValues[len(sourceValues)-2], ackOperation: sourceValues[len(sourceValues)-1],
 	}
-	if !receiverTargetDigest(source.sourceIDDigest) || !receiverTargetPositiveUint(source.stateEpoch) || !receiverTargetPositiveUint(source.enqueueGeneration) || source.values[3] != "4096" || !receiverTargetDigest(source.taskDigest) || source.releaseFence != "open" || !receiverTargetPositiveUint(source.targetRevision) || !receiverTargetPositiveUint(source.values[7]) || !receiverTargetOptionalPositiveUint(source.nativeExpiry) || !receiverTargetOptionalPositiveUint(source.values[9]) || !receiverTargetDigest(source.ackReceipt) || !receiverTargetDigest(source.ackOperation) {
+	if !receiverTargetDigest(source.sourceIDDigest) || !receiverTargetPositiveUint(source.stateEpoch) || !receiverTargetPositiveUint(source.enqueueGeneration) || source.values[3] != "4096" || !receiverTargetDigest(source.taskDigest) || source.releaseFence != "open" && (!allowClosed || source.releaseFence != "closed") || !receiverTargetPositiveUint(source.targetRevision) || !receiverTargetPositiveUint(source.values[7]) || !receiverTargetOptionalPositiveUint(source.nativeExpiry) || !receiverTargetOptionalPositiveUint(source.values[9]) || !receiverTargetDigest(source.ackReceipt) || !receiverTargetDigest(source.ackOperation) {
 		return source, fmt.Errorf("invalid finalized source values")
 	}
 	if sourceCount == 14 && (!receiverTargetDigest(sourceValues[10]) || !receiverTargetDigest(sourceValues[11])) {
