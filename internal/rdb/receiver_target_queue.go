@@ -796,6 +796,9 @@ return 1
 
 var receiverTargetRunTaskCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 0 then return 0 end
+if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
+	return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
+end
 local state, group = unpack(redis.call("HMGET", KEYS[1], "state", "group"))
 if state == "active" then return -1 end
 if state == "pending" then return -2 end
@@ -826,6 +829,11 @@ return 1
 
 var receiverTargetRunAllCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
+for _, id in ipairs(ids) do
+	if redis.call("HEXISTS", ARGV[1] .. id, "sourceIdDigest") == 1 then
+		return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
+	end
+end
 local tail = redis.call("ZREVRANGE", KEYS[2], 0, 0, "WITHSCORES")
 local score = -1
 if #tail ~= 0 then
@@ -850,6 +858,11 @@ return table.getn(ids)
 
 var receiverTargetRunAllAggregatingCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
+for _, id in ipairs(ids) do
+	if redis.call("HEXISTS", ARGV[1] .. id, "sourceIdDigest") == 1 then
+		return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
+	end
+end
 local tail = redis.call("ZREVRANGE", KEYS[2], 0, 0, "WITHSCORES")
 local score = -1
 if #tail ~= 0 then
