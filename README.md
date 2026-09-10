@@ -2,6 +2,9 @@
 
 # Simple, reliable & efficient distributed task queue in Go
 
+NebInfra maintains this repository as a first-party fork. See
+[`FORK.md`](FORK.md) for its exact upstream base and scope.
+
 [![GoDoc](https://godoc.org/github.com/hibiken/asynq?status.svg)](https://godoc.org/github.com/hibiken/asynq)
 [![Go Report Card](https://goreportcard.com/badge/github.com/hibiken/asynq)](https://goreportcard.com/report/github.com/hibiken/asynq)
 ![Build Status](https://github.com/hibiken/asynq/workflows/build/badge.svg)

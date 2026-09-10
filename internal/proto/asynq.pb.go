@@ -672,7 +672,7 @@ const file_asynq_proto_rawDesc = "" +
 	"\x11prev_enqueue_time\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\x0fprevEnqueueTime\"o\n" +
 	"\x15SchedulerEnqueueEvent\x12\x17\n" +
 	"\atask_id\x18\x01 \x01(\tR\x06taskId\x12=\n" +
-	"\fenqueue_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\venqueueTimeB)Z'github.com/hibiken/asynq/internal/protob\x06proto3"
+	"\fenqueue_time\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\venqueueTimeB*Z(github.com/nebinfra/asynq/internal/protob\x06proto3"
 
 var (
 	file_asynq_proto_rawDescOnce sync.Once

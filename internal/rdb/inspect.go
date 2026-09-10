@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/errors"
+	"github.com/nebinfra/asynq/internal/base"
+	"github.com/nebinfra/asynq/internal/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/spf13/cast"
 )
