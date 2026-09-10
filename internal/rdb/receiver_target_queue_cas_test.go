@@ -2,6 +2,7 @@ package rdb
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -146,6 +147,88 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
 		t.Fatalf("marked enqueue replay: %v", err)
 	}
+}
+
+func TestEnqueueReceiverTargetTaskHashBoundary(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	now := time.Unix(1725148800, 123)
+	r.SetClock(timeutil.NewSimulatedClock(now))
+	input := receiverTargetInitialFixture(now)
+
+	tooLarge := receiverTargetMessageWithTaskHashSize(t, input, now, receiverTargetMaximumTaskHashBytes+1)
+	encoded, err := base.EncodeMessage(tooLarge)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.EnqueueReceiverTarget(t.Context(), tooLarge, input); errors.CanonicalCode(err) != errors.FailedPrecondition {
+		t.Fatalf("maximum plus one error = %v, want FailedPrecondition", err)
+	}
+	if size := r.client.DBSize(t.Context()).Val(); size != 0 {
+		t.Fatalf("database key count after maximum plus one refusal = %d, want 0", size)
+	}
+
+	maximum := receiverTargetMessageWithTaskHashSize(t, input, now, receiverTargetMaximumTaskHashBytes)
+	encoded, err = base.EncodeMessage(maximum)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err := r.receiverTargetInitialCommand(t.Context(), maximum, encoded, input)
+	if err != nil {
+		t.Fatalf("maximum task hash: %v", err)
+	}
+	seedReceiverTargetCommon(t, r, keys, input)
+	if err := r.EnqueueReceiverTarget(t.Context(), maximum, input); err != nil {
+		t.Fatalf("enqueue maximum task hash: %v", err)
+	}
+	fields := r.client.HGetAll(t.Context(), keys[10]).Val()
+	if got := receiverTargetMapHashBytes(fields); got != receiverTargetMaximumTaskHashBytes {
+		t.Fatalf("stored task hash bytes = %d, want %d", got, receiverTargetMaximumTaskHashBytes)
+	}
+}
+
+func receiverTargetInitialFixture(now time.Time) base.ReceiverTargetQueueInitial {
+	digest := strings.Repeat("d", 64)
+	input := base.ReceiverTargetQueueInitial{
+		RuntimeEpochRevision: "7", StateEpoch: "9", CatalogGeneration: digest,
+		InstanceTenant: "nebcore", EffectID: "00000000-0000-4000-8000-000000000001:1:queue_wakeup:0",
+		TaskDigest: strings.Repeat("b", 64), ProcessAt: now,
+	}
+	input.SourceIDDigest = receiverTargetSHA256(`{"effectId":"` + input.EffectID + `","handlerDigest":"` + input.TaskDigest + `","instanceTenant":"` + input.InstanceTenant + `","payloadDigest":"` + strings.Repeat("e", 64) + `","schemaVersion":"queue-wakeup.source-id.v1","sourceRevision":"1","stateEpoch":"` + input.StateEpoch + `"}`)
+	return input
+}
+
+func receiverTargetMessageWithTaskHashSize(t *testing.T, input base.ReceiverTargetQueueInitial, now time.Time, want int64) *base.TaskMessage {
+	t.Helper()
+	for low, high := 0, int(want); low <= high; {
+		payloadSize := low + (high-low)/2
+		msg := &base.TaskMessage{ID: "advance:task", Type: "nebpilot:advance", Payload: make([]byte, payloadSize), Queue: base.DefaultQueueName, Retry: 3}
+		encoded, err := base.EncodeMessage(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fields := []string{"msg", "state", "sourceIdDigest", "stateEpoch", "enqueueGeneration", "taskDigest", "pending_since"}
+		values := []string{string(encoded), "pending", input.SourceIDDigest, input.StateEpoch, "1", input.TaskDigest, strconv.FormatInt(now.UnixNano(), 10)}
+		size := receiverTargetHashBytes(fields, values)
+		if size == want {
+			return msg
+		}
+		if size < want {
+			low = payloadSize + 1
+		} else {
+			high = payloadSize - 1
+		}
+	}
+	t.Fatalf("could not construct task hash with %d bytes", want)
+	return nil
+}
+
+func receiverTargetMapHashBytes(fields map[string]string) int64 {
+	var total int64
+	for field, value := range fields {
+		total += int64(len(field) + len(value))
+	}
+	return total
 }
 
 func seedReceiverTargetCommon(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string, input base.ReceiverTargetQueueInitial) {
