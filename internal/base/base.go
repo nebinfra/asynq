@@ -692,7 +692,6 @@ type Broker interface {
 	Close() error
 	Enqueue(ctx context.Context, msg *TaskMessage) error
 	EnqueueReceiverTarget(ctx context.Context, msg *TaskMessage, input ReceiverTargetQueueInitial) error
-	ReleaseReceiverTarget(ctx context.Context, taskID string, input ReceiverTargetQueueRelease) error
 	EnqueueUnique(ctx context.Context, msg *TaskMessage, ttl time.Duration) error
 	Dequeue(qnames ...string) (*TaskMessage, time.Time, error)
 	Done(ctx context.Context, msg *TaskMessage) error
@@ -743,16 +742,4 @@ type ReceiverTargetQueueInitial struct {
 	SourceIDDigest       string
 	TaskDigest           string
 	ProcessAt            time.Time
-}
-
-// ReceiverTargetQueueRelease identifies the finalized source of one absent
-// marked task. The broker derives and verifies all physical coordinates.
-type ReceiverTargetQueueRelease struct {
-	RuntimeEpochRevision string
-	StateEpoch           string
-	CatalogGeneration    string
-	InstanceTenant       string
-	EffectID             string
-	SourceIDDigest       string
-	TaskDigest           string
 }

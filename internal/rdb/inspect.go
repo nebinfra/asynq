@@ -1209,11 +1209,6 @@ func (r *RDB) ArchiveAllScheduledTasks(qname string) (int64, error) {
 var archiveAllAggregatingCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	if redis.call("HEXISTS", ARGV[4] .. id, "sourceIdDigest") == 1 then
-		return redis.error_reply("RECEIVER TARGET ARCHIVE UNSUPPORTED")
-	end
-end
-for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
 	redis.call("HSET", ARGV[4] .. id, "state", "archived")
 end
@@ -1278,11 +1273,6 @@ else
 	ids = redis.call("LRANGE", KEYS[1], 0, -1)
 end
 for _, id in ipairs(ids) do
-	if redis.call("HEXISTS", ARGV[4] .. id, "sourceIdDigest") == 1 then
-		return redis.error_reply("RECEIVER TARGET ARCHIVE UNSUPPORTED")
-	end
-end
-for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
 	redis.call("HSET", ARGV[4] .. id, "state", "archived")
 end
@@ -1345,9 +1335,6 @@ func (r *RDB) ArchiveAllPendingTasks(qname string) (int64, error) {
 var archiveTaskCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return 0
-end
-if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
-	return redis.error_reply("RECEIVER TARGET ARCHIVE UNSUPPORTED")
 end
 local state, group = unpack(redis.call("HMGET", KEYS[1], "state", "group"))
 if state == "active" then
@@ -1453,11 +1440,6 @@ func (r *RDB) ArchiveTask(qname, id string) error {
 var archiveAllCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	if redis.call("HEXISTS", ARGV[4] .. id, "sourceIdDigest") == 1 then
-		return redis.error_reply("RECEIVER TARGET ARCHIVE UNSUPPORTED")
-	end
-end
-for _, id in ipairs(ids) do
 	redis.call("ZADD", KEYS[2], ARGV[1], id)
 	redis.call("HSET", ARGV[4] .. id, "state", "archived")
 end
@@ -1510,9 +1492,6 @@ var updateTaskPayloadCmd = redis.NewScript(`
 -- Check if given taks exists
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return 0
-end
-if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
-	return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
 end
 local state, pending_since, group, unique_key = unpack(redis.call("HMGET", KEYS[1], "state", "pending_since", "group", "unique_key"))
 if state ~= "scheduled" then
@@ -1602,9 +1581,6 @@ func (r *RDB) UpdateTaskPayload(qname, id string, payload []byte) error {
 var deleteTaskCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 0 then
 	return 0
-end
-if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
-	return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
 end
 local state, group = unpack(redis.call("HMGET", KEYS[1], "state", "group"))
 if state == "active" then
@@ -1748,11 +1724,6 @@ func (r *RDB) DeleteAllCompletedTasks(qname string) (int64, error) {
 var deleteAllCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 for _, id in ipairs(ids) do
-	if redis.call("HEXISTS", ARGV[1] .. id, "sourceIdDigest") == 1 then
-		return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
-	end
-end
-for _, id in ipairs(ids) do
 	local task_key = ARGV[1] .. id
 	local unique_key = redis.call("HGET", task_key, "unique_key")
 	if unique_key and unique_key ~= "" and redis.call("GET", unique_key) == id then
@@ -1792,11 +1763,6 @@ func (r *RDB) deleteAll(key, qname string) (int64, error) {
 // ARGV[2] -> group name
 var deleteAllAggregatingCmd = redis.NewScript(`
 local ids = redis.call("ZRANGE", KEYS[1], 0, -1)
-for _, id in ipairs(ids) do
-	if redis.call("HEXISTS", ARGV[1] .. id, "sourceIdDigest") == 1 then
-		return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
-	end
-end
 for _, id in ipairs(ids) do
 	redis.call("DEL", ARGV[1] .. id)
 end
@@ -1846,11 +1812,6 @@ if redis.call("TYPE", KEYS[1]).ok == "zset" then
 	ids = redis.call("ZRANGE", KEYS[1], 0, -1)
 else
 	ids = redis.call("LRANGE", KEYS[1], 0, -1)
-end
-for _, id in ipairs(ids) do
-	if redis.call("HEXISTS", ARGV[1] .. id, "sourceIdDigest") == 1 then
-		return redis.error_reply("RECEIVER TARGET INSPECTOR MUTATION UNSUPPORTED")
-	end
 end
 for _, id in ipairs(ids) do
 	redis.call("DEL", ARGV[1] .. id)
