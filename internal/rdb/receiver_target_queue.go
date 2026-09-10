@@ -15,7 +15,10 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-const receiverTargetMaximumQueueScore = 9007199254740991
+const (
+	receiverTargetMaximumQueueScore    = 9007199254740991
+	receiverTargetMaximumTaskHashBytes = 271559
+)
 
 const (
 	receiverTargetQueueKeyCount     = 24
@@ -62,7 +65,7 @@ func (r *RDB) EnqueueReceiverTarget(ctx context.Context, msg *base.TaskMessage, 
 func (r *RDB) receiverTargetInitialCommand(ctx context.Context, msg *base.TaskMessage, encoded []byte, input base.ReceiverTargetQueueInitial) ([receiverTargetQueueKeyCount]string, [receiverTargetQueueOperandCount]string, error) {
 	var keys [receiverTargetQueueKeyCount]string
 	var operands [receiverTargetQueueOperandCount]string
-	if msg == nil || msg.Queue != base.DefaultQueueName || msg.ID == "" || len(msg.ID) > 256 || len(encoded) == 0 || len(encoded) > 271559 ||
+	if msg == nil || msg.Queue != base.DefaultQueueName || msg.ID == "" || len(msg.ID) > 256 || len(encoded) == 0 ||
 		!receiverTargetPositiveUint(input.RuntimeEpochRevision) || !receiverTargetPositiveUint(input.StateEpoch) || len(input.CatalogGeneration) != 64 || len(input.InstanceTenant) == 0 || len(input.InstanceTenant) > 63 ||
 		len(input.EffectID) == 0 || len(input.EffectID) > 128 || !receiverTargetDigest(input.SourceIDDigest) || !receiverTargetDigest(input.TaskDigest) {
 		return keys, operands, fmt.Errorf("invalid initial receiver input")
@@ -82,8 +85,12 @@ func (r *RDB) receiverTargetInitialCommand(ctx context.Context, msg *base.TaskMe
 		taskFields = append(taskFields, "pending_since")
 		taskValues = append(taskValues, next)
 	}
+	taskBytes := receiverTargetHashBytes(taskFields, taskValues)
+	if taskBytes > receiverTargetMaximumTaskHashBytes {
+		return keys, operands, fmt.Errorf("marked task hash exceeds maximum")
+	}
 	rows := int64(len(sourceFields) + len(taskFields) + 1)
-	bytes := receiverTargetHashBytes(sourceFields, sourceValues) + receiverTargetHashBytes(taskFields, taskValues) + int64(len(msg.ID)+len(score))
+	bytes := receiverTargetHashBytes(sourceFields, sourceValues) + taskBytes + int64(len(msg.ID)+len(score))
 	epoch := input.StateEpoch
 	keys = [receiverTargetQueueKeyCount]string{
 		"nebpilot:runtime:epoch",
