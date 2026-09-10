@@ -111,7 +111,7 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 		TaskDigest: strings.Repeat("b", 64), ProcessAt: now,
 	}
 	input.SourceIDDigest = receiverTargetSHA256(`{"effectId":"` + input.EffectID + `","handlerDigest":"` + input.TaskDigest + `","instanceTenant":"` + input.InstanceTenant + `","payloadDigest":"` + strings.Repeat("e", 64) + `","schemaVersion":"queue-wakeup.source-id.v1","sourceRevision":"1","stateEpoch":"` + input.StateEpoch + `"}`)
-	msg := &base.TaskMessage{ID: "advance:task", Type: "nebpilot:advance", Payload: []byte(`{"effectId":"fixture"}`), Queue: base.DefaultQueueName, Retry: 3}
+	msg := &base.TaskMessage{ID: "advance:task", Type: "nebpilot:advance", Payload: []byte(`{"effectId":"00000000-0000-4000-8000-000000000001:1:queue_wakeup:0","schemaVersion":"nebpilot.queue-effect-task.v1","sourceRevision":"1","taskPayload":{},"taskPayloadDigest":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}`), Queue: base.DefaultQueueName, Retry: 3}
 	encoded, err := base.EncodeMessage(msg)
 	if err != nil {
 		t.Fatal(err)
@@ -148,6 +148,38 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 	}
 	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
 		t.Fatalf("marked enqueue replay: %v", err)
+	}
+	dequeued, _, err := r.Dequeue(base.DefaultQueueName)
+	if err != nil || dequeued.ID != msg.ID {
+		t.Fatalf("marked dequeue = %v, %v", dequeued, err)
+	}
+	if _, err := r.ExtendLease(base.DefaultQueueName, dequeued.ID); err != nil {
+		t.Fatalf("marked lease extension: %v", err)
+	}
+	if err := r.Requeue(t.Context(), dequeued); err != nil {
+		t.Fatalf("marked requeue: %v", err)
+	}
+	dequeued, _, err = r.Dequeue(base.DefaultQueueName)
+	if err != nil || dequeued.ID != msg.ID {
+		t.Fatalf("marked dequeue after requeue = %v, %v", dequeued, err)
+	}
+	due := now.Add(time.Minute)
+	if err := r.Retry(t.Context(), dequeued, due, "retry", true); err != nil {
+		t.Fatalf("marked retry: %v", err)
+	}
+	r.SetClock(timeutil.NewSimulatedClock(due.Add(time.Second)))
+	if err := r.ForwardIfReady(base.DefaultQueueName); err != nil {
+		t.Fatalf("marked due forward: %v", err)
+	}
+	dequeued, _, err = r.Dequeue(base.DefaultQueueName)
+	if err != nil || dequeued.ID != msg.ID {
+		t.Fatalf("marked dequeue after retry = %v, %v", dequeued, err)
+	}
+	if err := r.Done(t.Context(), dequeued); err != nil {
+		t.Fatalf("marked done: %v", err)
+	}
+	if exists := r.client.Exists(t.Context(), keys[10]).Val(); exists != 0 {
+		t.Fatalf("marked task exists after done: %d", exists)
 	}
 }
 
@@ -186,6 +218,65 @@ func TestEnqueueReceiverTargetTaskHashBoundary(t *testing.T) {
 	fields := r.client.HGetAll(t.Context(), keys[10]).Val()
 	if got := receiverTargetMapHashBytes(fields); got != receiverTargetMaximumTaskHashBytes {
 		t.Fatalf("stored task hash bytes = %d, want %d", got, receiverTargetMaximumTaskHashBytes)
+	}
+}
+
+func TestEnqueueReceiverTargetRefusesUnsupportedNativeFields(t *testing.T) {
+	now := time.Unix(1725148800, 123)
+	for _, mutate := range []func(*base.TaskMessage){
+		func(msg *base.TaskMessage) { msg.UniqueKey = "unique" },
+		func(msg *base.TaskMessage) { msg.GroupKey = "group" },
+		func(msg *base.TaskMessage) { msg.Retention = 1 },
+	} {
+		r := setup(t)
+		input := receiverTargetInitialFixture(now)
+		msg := receiverTargetQueueEffectMessage()
+		mutate(msg)
+		if err := r.EnqueueReceiverTarget(t.Context(), msg, input); errors.CanonicalCode(err) != errors.FailedPrecondition {
+			t.Fatalf("unsupported native fields error = %v, want FailedPrecondition", err)
+		}
+		if size := r.client.DBSize(t.Context()).Val(); size != 0 {
+			t.Fatalf("database key count after refusal = %d, want 0", size)
+		}
+		r.Close()
+	}
+}
+
+func TestDequeueReceiverTargetRefusesCorruptEnvelopeWithoutWrites(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	now := time.Unix(1725148800, 123)
+	r.SetClock(timeutil.NewSimulatedClock(now))
+	input := receiverTargetInitialFixture(now)
+	msg := receiverTargetQueueEffectMessage()
+	encoded, err := base.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err := r.receiverTargetInitialCommand(t.Context(), msg, encoded, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedReceiverTargetCommon(t, r, keys, input)
+	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
+		t.Fatal(err)
+	}
+	msg.Payload = []byte(`{"effectId":"wrong","schemaVersion":"nebpilot.queue-effect-task.v1","sourceRevision":"1","taskPayload":{},"taskPayloadDigest":"` + strings.Repeat("0", 64) + `"}`)
+	corrupt, err := base.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.HSet(t.Context(), keys[10], "msg", corrupt).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _, err := r.Dequeue(base.DefaultQueueName); errors.CanonicalCode(err) != errors.FailedPrecondition || got != nil {
+		t.Fatalf("corrupt marked dequeue = %v, %v, want FailedPrecondition", got, err)
+	}
+	if state := r.client.HGet(t.Context(), keys[10], "state").Val(); state != "pending" {
+		t.Fatalf("task state after refusal = %q, want pending", state)
+	}
+	if score, err := r.client.ZScore(t.Context(), keys[11], msg.ID).Result(); err != nil || score != 0 {
+		t.Fatalf("pending membership after refusal = %v, %v", score, err)
 	}
 }
 
@@ -254,6 +345,13 @@ func receiverTargetInitialFixture(now time.Time) base.ReceiverTargetQueueInitial
 	}
 	input.SourceIDDigest = receiverTargetSHA256(`{"effectId":"` + input.EffectID + `","handlerDigest":"` + input.TaskDigest + `","instanceTenant":"` + input.InstanceTenant + `","payloadDigest":"` + strings.Repeat("e", 64) + `","schemaVersion":"queue-wakeup.source-id.v1","sourceRevision":"1","stateEpoch":"` + input.StateEpoch + `"}`)
 	return input
+}
+
+func receiverTargetQueueEffectMessage() *base.TaskMessage {
+	return &base.TaskMessage{
+		ID: "advance:task", Type: "nebpilot:advance", Queue: base.DefaultQueueName, Retry: 3,
+		Payload: []byte(`{"effectId":"00000000-0000-4000-8000-000000000001:1:queue_wakeup:0","schemaVersion":"nebpilot.queue-effect-task.v1","sourceRevision":"1","taskPayload":{},"taskPayloadDigest":"44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"}`),
+	}
 }
 
 func receiverTargetMessageWithTaskHashSize(t *testing.T, input base.ReceiverTargetQueueInitial, now time.Time, want int64) *base.TaskMessage {
