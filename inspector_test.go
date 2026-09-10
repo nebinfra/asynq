@@ -402,7 +402,12 @@ func TestInspectorGetQueueInfo(t *testing.T) {
 			if enqueueTime.IsZero() {
 				continue
 			}
-			oldestPendingMessageID := r.LRange(ctx, base.PendingKey(qname), -1, -1).Val()[0] // get the right most msg in the list
+			var oldestPendingMessageID string
+			if qname == base.DefaultQueueName {
+				oldestPendingMessageID = r.ZRange(ctx, base.PendingKey(qname), 0, 0).Val()[0]
+			} else {
+				oldestPendingMessageID = r.LRange(ctx, base.PendingKey(qname), -1, -1).Val()[0]
+			}
 			r.HSet(ctx, base.TaskKey(qname, oldestPendingMessageID), "pending_since", enqueueTime.UnixNano())
 		}
 

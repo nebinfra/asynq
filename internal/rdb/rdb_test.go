@@ -89,15 +89,20 @@ func TestEnqueue(t *testing.T) {
 			continue
 		}
 
-		// Check Pending list has task ID.
+		// Check the pending queue has the task ID.
 		pendingKey := base.PendingKey(tc.msg.Queue)
-		pendingIDs := r.client.LRange(context.Background(), pendingKey, 0, -1).Val()
+		var pendingIDs []string
+		if tc.msg.Queue == base.DefaultQueueName {
+			pendingIDs = r.client.ZRange(context.Background(), pendingKey, 0, -1).Val()
+		} else {
+			pendingIDs = r.client.LRange(context.Background(), pendingKey, 0, -1).Val()
+		}
 		if n := len(pendingIDs); n != 1 {
-			t.Errorf("Redis LIST %q contains %d IDs, want 1", pendingKey, n)
+			t.Errorf("Redis queue %q contains %d IDs, want 1", pendingKey, n)
 			continue
 		}
 		if pendingIDs[0] != tc.msg.ID {
-			t.Errorf("Redis LIST %q: got %v, want %v", pendingKey, pendingIDs, []string{tc.msg.ID})
+			t.Errorf("Redis queue %q: got %v, want %v", pendingKey, pendingIDs, []string{tc.msg.ID})
 			continue
 		}
 
@@ -256,15 +261,20 @@ func TestEnqueueUnique(t *testing.T) {
 			t.Errorf("%q is not a member of SET %q", tc.msg.Queue, base.AllQueues)
 		}
 
-		// Check Pending list has task ID.
+		// Check the pending queue has the task ID.
 		pendingKey := base.PendingKey(tc.msg.Queue)
-		pendingIDs := r.client.LRange(context.Background(), pendingKey, 0, -1).Val()
+		var pendingIDs []string
+		if tc.msg.Queue == base.DefaultQueueName {
+			pendingIDs = r.client.ZRange(context.Background(), pendingKey, 0, -1).Val()
+		} else {
+			pendingIDs = r.client.LRange(context.Background(), pendingKey, 0, -1).Val()
+		}
 		if len(pendingIDs) != 1 {
-			t.Errorf("Redis LIST %q contains %d IDs, want 1", pendingKey, len(pendingIDs))
+			t.Errorf("Redis queue %q contains %d IDs, want 1", pendingKey, len(pendingIDs))
 			continue
 		}
 		if pendingIDs[0] != tc.msg.ID {
-			t.Errorf("Redis LIST %q: got %v, want %v", pendingKey, pendingIDs, []string{tc.msg.ID})
+			t.Errorf("Redis queue %q: got %v, want %v", pendingKey, pendingIDs, []string{tc.msg.ID})
 			continue
 		}
 
