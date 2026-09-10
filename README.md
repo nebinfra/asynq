@@ -5,9 +5,9 @@
 NebInfra maintains this repository as a first-party fork. See
 [`FORK.md`](FORK.md) for its exact upstream base and scope.
 
-[![GoDoc](https://godoc.org/github.com/hibiken/asynq?status.svg)](https://godoc.org/github.com/hibiken/asynq)
-[![Go Report Card](https://goreportcard.com/badge/github.com/hibiken/asynq)](https://goreportcard.com/report/github.com/hibiken/asynq)
-![Build Status](https://github.com/hibiken/asynq/workflows/build/badge.svg)
+[![Go Reference](https://pkg.go.dev/badge/github.com/nebinfra/asynq.svg)](https://pkg.go.dev/github.com/nebinfra/asynq)
+[![Go Report Card](https://goreportcard.com/badge/github.com/nebinfra/asynq)](https://goreportcard.com/report/github.com/nebinfra/asynq)
+![Build Status](https://github.com/nebinfra/asynq/actions/workflows/build.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Gitter chat](https://badges.gitter.im/go-asynq/gitter.svg)](https://gitter.im/go-asynq/community)
 
@@ -64,7 +64,7 @@ Make sure you have Go installed ([download](https://golang.org/dl/)). The **last
 Initialize your project by creating a folder and then running `go mod init github.com/your/repo` ([learn more](https://blog.golang.org/using-go-modules)) inside the folder. Then install Asynq library with the [`go get`](https://golang.org/cmd/go/#hdr-Add_dependencies_to_current_module_and_install_them) command:
 
 ```sh
-go get -u github.com/hibiken/asynq
+go get -u github.com/nebinfra/asynq
 ```
 
 Make sure you're running a Redis server locally or from a [Docker](https://hub.docker.com/_/redis) container. Version `4.0` or higher is required.
@@ -80,7 +80,7 @@ import (
     "fmt"
     "log"
     "time"
-    "github.com/hibiken/asynq"
+    "github.com/nebinfra/asynq"
 )
 
 // A list of task types.
@@ -158,7 +158,7 @@ func NewImageProcessor() *ImageProcessor {
 }
 ```
 
-In your application code, import the above package and use [`Client`](https://pkg.go.dev/github.com/hibiken/asynq?tab=doc#Client) to put tasks on queues.
+In your application code, import the above package and use [`Client`](https://pkg.go.dev/github.com/nebinfra/asynq#Client) to put tasks on queues.
 
 ```go
 package main
@@ -167,7 +167,7 @@ import (
     "log"
     "time"
 
-    "github.com/hibiken/asynq"
+    "github.com/nebinfra/asynq"
     "your/app/package/tasks"
 )
 
@@ -222,7 +222,7 @@ func main() {
 }
 ```
 
-Next, start a worker server to process these tasks in the background. To start the background workers, use [`Server`](https://pkg.go.dev/github.com/hibiken/asynq?tab=doc#Server) and provide your [`Handler`](https://pkg.go.dev/github.com/hibiken/asynq?tab=doc#Handler) to process the tasks.
+Next, start a worker server to process these tasks in the background. To start the background workers, use [`Server`](https://pkg.go.dev/github.com/nebinfra/asynq#Server) and provide your [`Handler`](https://pkg.go.dev/github.com/nebinfra/asynq#Handler) to process the tasks.
 
 You can optionally use [`ServeMux`](https://pkg.go.dev/github.com/hibiken/asynq?tab=doc#ServeMux) to create a handler, just as you would with [`net/http`](https://golang.org/pkg/net/http/) Handler.
 
@@ -232,7 +232,7 @@ package main
 import (
     "log"
 
-    "github.com/hibiken/asynq"
+    "github.com/nebinfra/asynq"
     "your/app/package/tasks"
 )
 
@@ -268,7 +268,7 @@ func main() {
 
 For a more detailed walk-through of the library, see our [Getting Started](https://github.com/hibiken/asynq/wiki/Getting-Started) guide.
 
-To learn more about `asynq` features and APIs, see the package [godoc](https://godoc.org/github.com/hibiken/asynq).
+To learn more about `asynq` features and APIs, see the package [documentation](https://pkg.go.dev/github.com/nebinfra/asynq).
 
 ## Web UI
 
