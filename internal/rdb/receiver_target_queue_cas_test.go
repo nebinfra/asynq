@@ -251,6 +251,16 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 	if err := r.client.HSet(t.Context(), keys[8], "state", "committed", "receiptRevision", "1").Err(); err != nil {
 		t.Fatal(err)
 	}
+	releaseKeys, _, err := r.receiverTargetReleaseCommand(t.Context(), msg.ID, release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := releaseKeys[20], base.ProcessedKey(base.DefaultQueueName, now); got != want {
+		t.Fatalf("release processed day key = %q, want %q", got, want)
+	}
+	if got, want := releaseKeys[22], base.FailedKey(base.DefaultQueueName, now); got != want {
+		t.Fatalf("release failed day key = %q, want %q", got, want)
+	}
 	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
 		t.Fatalf("release absent marked task: %v", err)
 	}
