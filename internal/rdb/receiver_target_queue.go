@@ -114,6 +114,50 @@ func (r *RDB) executeReceiverTargetTaskCAS(ctx context.Context, op errors.Op, ke
 	return err
 }
 
+func (r *RDB) ReleaseReceiverTarget(ctx context.Context, taskID string, input base.ReceiverTargetQueueRelease) error {
+	const op errors.Op = "rdb.ReleaseReceiverTarget"
+	keys, operands, err := r.receiverTargetReleaseCommand(ctx, taskID, input)
+	if err != nil {
+		return errors.E(op, errors.FailedPrecondition, err)
+	}
+	return r.executeReceiverTargetTaskCAS(ctx, op, keys, operands)
+}
+
+func (r *RDB) receiverTargetReleaseCommand(ctx context.Context, taskID string, input base.ReceiverTargetQueueRelease) ([receiverTargetQueueKeyCount]string, [receiverTargetQueueOperandCount]string, error) {
+	var keys [receiverTargetQueueKeyCount]string
+	var operands [receiverTargetQueueOperandCount]string
+	if taskID == "" || len(taskID) > 256 || !receiverTargetPositiveUint(input.RuntimeEpochRevision) || !receiverTargetPositiveUint(input.StateEpoch) || !receiverTargetDigest(input.CatalogGeneration) || input.InstanceTenant == "" || len(input.InstanceTenant) > 63 || input.EffectID == "" || len(input.EffectID) > 128 || !receiverTargetDigest(input.SourceIDDigest) || !receiverTargetDigest(input.TaskDigest) {
+		return keys, operands, fmt.Errorf("invalid release receiver input")
+	}
+	sourceKey := "nebpilot:e:" + input.StateEpoch + ":receiver-target:queue-reservation:" + input.SourceIDDigest + ":" + taskID
+	source, err := r.receiverTargetFinalizedSource(ctx, sourceKey)
+	if err != nil {
+		return keys, operands, err
+	}
+	if source.sourceIDDigest != input.SourceIDDigest || source.stateEpoch != input.StateEpoch || source.taskDigest != input.TaskDigest || source.releaseFence != "open" {
+		return keys, operands, fmt.Errorf("release source mismatch")
+	}
+	frame := receiverTargetSuccessorSourceID(source, input.EffectID, taskID)
+	evidence := receiverTargetSuccessorEvidenceDigest(frame, source)
+	receipt := receiverTargetOperationReceiptIdentity(source.stateEpoch, input.InstanceTenant, frame, "Release", "release_acknowledged_absent", "existing_source_revision")
+	epochID := source.stateEpoch
+	keys = [receiverTargetQueueKeyCount]string{
+		"nebpilot:runtime:epoch", "nebpilot:e:" + epochID + ":receiver-target:active", "nebpilot:e:" + epochID + ":receiver-target:active-revision", "nebpilot:e:" + epochID + ":receiver-target:advancement:queueWakeup", "nebpilot:e:" + epochID + ":receiver-target:capacity",
+		"nebpilot:e:" + epochID + ":receiver-target:receipt:" + receipt, "nebpilot:e:" + epochID + ":receiver-target:queue-ack:" + receipt, "nebpilot:e:" + epochID + ":effects:body:" + input.EffectID, "nebpilot:e:" + epochID + ":effects:receiver-inbox:body:" + input.EffectID, sourceKey,
+		base.TaskKey(base.DefaultQueueName, taskID), base.PendingKey(base.DefaultQueueName), base.ActiveKey(base.DefaultQueueName), base.ScheduledKey(base.DefaultQueueName), base.RetryKey(base.DefaultQueueName), base.ArchivedKey(base.DefaultQueueName), base.CompletedKey(base.DefaultQueueName), base.LeaseKey(base.DefaultQueueName), base.AllQueues, base.PausedKey(base.DefaultQueueName), "", base.ProcessedTotalKey(base.DefaultQueueName), "", base.FailedTotalKey(base.DefaultQueueName),
+	}
+	afterFields := []string{"sourceIdDigest", "stateEpoch", "enqueueGeneration", "reservedBytes", "taskDigest", "releaseFence", "targetRevision", "sourceEnqueueGeneration", "nativeExpiry", "sourceNativeExpiry", "predecessorAckReceiptDigest", "predecessorAckOperationDigest", "receiptIdentityDigest"}
+	afterValues := []string{source.sourceIDDigest, source.stateEpoch, source.enqueueGeneration, "4096", source.taskDigest, "closed", source.targetRevision, source.enqueueGeneration, "", source.nativeExpiry, source.ackReceipt, source.ackOperation, receipt}
+	operands = [receiverTargetQueueOperandCount]string{
+		frame, evidence, input.RuntimeEpochRevision, input.CatalogGeneration, input.InstanceTenant, source.targetRevision, receipt,
+		"release", "", source.taskDigest, "", "", "", "",
+		strconv.FormatInt(int64(len(afterFields)-len(source.fields)), 10),
+		strconv.FormatInt(receiverTargetHashBytes(afterFields, afterValues)-receiverTargetHashBytes(source.fields, source.values), 10),
+		"0", "", "", "0",
+	}
+	return keys, operands, nil
+}
+
 func (r *RDB) receiverTargetRecoveryCommand(
 	ctx context.Context,
 	msg *base.TaskMessage,

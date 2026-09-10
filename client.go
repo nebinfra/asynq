@@ -102,6 +102,18 @@ type ReceiverTargetQueueInitial struct {
 	TaskDigest           string
 }
 
+// ReceiverTargetQueueRelease identifies the finalized source of one absent
+// marked task. The broker derives the sealed Release operation internally.
+type ReceiverTargetQueueRelease struct {
+	RuntimeEpochRevision string
+	StateEpoch           string
+	CatalogGeneration    string
+	InstanceTenant       string
+	EffectID             string
+	SourceIDDigest       string
+	TaskDigest           string
+}
+
 // WithReceiverTargetQueueInitial marks one enqueue for the generated receiver
 // transaction. It is valid only for the default queue without Unique or Group.
 func WithReceiverTargetQueueInitial(input ReceiverTargetQueueInitial) Option {
@@ -470,6 +482,21 @@ func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option)
 		return nil, err
 	}
 	return newTaskInfo(msg, state, opt.processAt, nil), nil
+}
+
+// ReleaseReceiverTarget closes the retained source for a completed marked task.
+// The generated transaction verifies committed execution acknowledgement and
+// exact task absence before changing the release fence.
+func (c *Client) ReleaseReceiverTarget(ctx context.Context, taskID string, input ReceiverTargetQueueRelease) error {
+	return c.broker.ReleaseReceiverTarget(ctx, taskID, base.ReceiverTargetQueueRelease{
+		RuntimeEpochRevision: input.RuntimeEpochRevision,
+		StateEpoch:           input.StateEpoch,
+		CatalogGeneration:    input.CatalogGeneration,
+		InstanceTenant:       input.InstanceTenant,
+		EffectID:             input.EffectID,
+		SourceIDDigest:       input.SourceIDDigest,
+		TaskDigest:           input.TaskDigest,
+	})
 }
 
 // Ping performs a ping against the redis connection.
