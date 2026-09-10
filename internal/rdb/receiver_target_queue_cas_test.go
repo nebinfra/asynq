@@ -328,6 +328,57 @@ func TestArchiveRefusesMarkedTaskWithoutWrites(t *testing.T) {
 	}
 }
 
+func TestInspectorRefusesMarkedTaskWithoutWrites(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(*RDB) error
+	}{
+		{name: "run task", run: func(r *RDB) error { return r.RunTask(base.DefaultQueueName, "advance:task") }},
+		{name: "archive task", run: func(r *RDB) error { return r.ArchiveTask(base.DefaultQueueName, "advance:task") }},
+		{name: "update payload", run: func(r *RDB) error { return r.UpdateTaskPayload(base.DefaultQueueName, "advance:task", []byte(`{}`)) }},
+		{name: "delete task", run: func(r *RDB) error { return r.DeleteTask(base.DefaultQueueName, "advance:task") }},
+		{name: "run all", run: func(r *RDB) error { _, err := r.RunAllScheduledTasks(base.DefaultQueueName); return err }},
+		{name: "archive all", run: func(r *RDB) error { _, err := r.ArchiveAllScheduledTasks(base.DefaultQueueName); return err }},
+		{name: "delete all", run: func(r *RDB) error { _, err := r.DeleteAllScheduledTasks(base.DefaultQueueName); return err }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := setup(t)
+			defer r.Close()
+			ctx := t.Context()
+			msg := receiverTargetQueueEffectMessage()
+			encoded, err := base.EncodeMessage(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			taskKey := base.TaskKey(msg.Queue, msg.ID)
+			fields := map[string]any{
+				"msg": string(encoded), "state": "scheduled", "sourceIdDigest": strings.Repeat("a", 64),
+				"stateEpoch": "9", "enqueueGeneration": "1", "taskDigest": strings.Repeat("b", 64),
+			}
+			if err := r.client.HSet(ctx, taskKey, fields).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.ZAdd(ctx, base.ScheduledKey(msg.Queue), redis.Z{Score: 123, Member: msg.ID}).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+				t.Fatal(err)
+			}
+			beforeFields := r.client.HGetAll(ctx, taskKey).Val()
+			if err := test.run(r); err == nil || !strings.Contains(err.Error(), "RECEIVER TARGET") {
+				t.Fatalf("marked Inspector mutation error = %v, want receiver target refusal", err)
+			}
+			if afterFields := r.client.HGetAll(ctx, taskKey).Val(); !reflect.DeepEqual(afterFields, beforeFields) {
+				t.Fatalf("marked task changed after refusal: %#v", afterFields)
+			}
+			if score, err := r.client.ZScore(ctx, base.ScheduledKey(msg.Queue), msg.ID).Result(); err != nil || score != 123 {
+				t.Fatalf("scheduled membership after refusal = %v, %v", score, err)
+			}
+		})
+	}
+}
+
 func mapStringAnyToString(input map[string]any) map[string]string {
 	output := make(map[string]string, len(input))
 	for key, value := range input {
