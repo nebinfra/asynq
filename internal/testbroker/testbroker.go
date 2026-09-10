@@ -55,6 +55,15 @@ func (tb *TestBroker) Enqueue(ctx context.Context, msg *base.TaskMessage) error 
 	return tb.real.Enqueue(ctx, msg)
 }
 
+func (tb *TestBroker) EnqueueReceiverTarget(ctx context.Context, msg *base.TaskMessage, input base.ReceiverTargetQueueInitial) error {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	if tb.sleeping {
+		return errRedisDown
+	}
+	return tb.real.EnqueueReceiverTarget(ctx, msg, input)
+}
+
 func (tb *TestBroker) EnqueueUnique(ctx context.Context, msg *base.TaskMessage, ttl time.Duration) error {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()

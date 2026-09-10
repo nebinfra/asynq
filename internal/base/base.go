@@ -691,6 +691,7 @@ type Broker interface {
 	Ping() error
 	Close() error
 	Enqueue(ctx context.Context, msg *TaskMessage) error
+	EnqueueReceiverTarget(ctx context.Context, msg *TaskMessage, input ReceiverTargetQueueInitial) error
 	EnqueueUnique(ctx context.Context, msg *TaskMessage, ttl time.Duration) error
 	Dequeue(qnames ...string) (*TaskMessage, time.Time, error)
 	Done(ctx context.Context, msg *TaskMessage) error
@@ -727,4 +728,18 @@ type Broker interface {
 	PublishCancelation(id string) error
 
 	WriteResult(qname, id string, data []byte) (n int, err error)
+}
+
+// ReceiverTargetQueueInitial is the sealed semantic input for one marked
+// initial enqueue. Physical Redis keys and operation variants remain internal
+// to the broker.
+type ReceiverTargetQueueInitial struct {
+	RuntimeEpochRevision string
+	StateEpoch           string
+	CatalogGeneration    string
+	InstanceTenant       string
+	EffectID             string
+	SourceIDDigest       string
+	TaskDigest           string
+	ProcessAt            time.Time
 }
