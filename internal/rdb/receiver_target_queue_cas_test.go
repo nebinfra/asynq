@@ -205,6 +205,66 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 	}
 }
 
+func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	now := time.Unix(1725148800, 123)
+	r.SetClock(timeutil.NewSimulatedClock(now))
+	input := receiverTargetInitialFixture(now)
+	msg := receiverTargetQueueEffectMessage()
+	encoded, err := base.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, _, err := r.receiverTargetInitialCommand(t.Context(), msg, encoded, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedReceiverTargetCommon(t, r, keys, input)
+	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
+		t.Fatal(err)
+	}
+	beforeTask := r.client.HGetAll(t.Context(), keys[10]).Val()
+	beforeSource := r.client.HGetAll(t.Context(), keys[9]).Val()
+	release := base.ReceiverTargetQueueRelease{
+		RuntimeEpochRevision: input.RuntimeEpochRevision, StateEpoch: input.StateEpoch,
+		CatalogGeneration: input.CatalogGeneration, InstanceTenant: input.InstanceTenant,
+		EffectID: input.EffectID, SourceIDDigest: input.SourceIDDigest, TaskDigest: input.TaskDigest,
+	}
+	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); errors.CanonicalCode(err) != errors.AlreadyExists {
+		t.Fatalf("release with present task error = %v, want AlreadyExists", err)
+	}
+	if got := r.client.HGetAll(t.Context(), keys[10]).Val(); !reflect.DeepEqual(got, beforeTask) {
+		t.Fatalf("task changed after refused release: got %#v, want %#v", got, beforeTask)
+	}
+	if got := r.client.HGetAll(t.Context(), keys[9]).Val(); !reflect.DeepEqual(got, beforeSource) {
+		t.Fatalf("source changed after refused release: got %#v, want %#v", got, beforeSource)
+	}
+
+	dequeued, _, err := r.Dequeue(base.DefaultQueueName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Done(t.Context(), dequeued); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.HSet(t.Context(), keys[8], "state", "committed", "receiptRevision", "1").Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
+		t.Fatalf("release absent marked task: %v", err)
+	}
+	if fence := r.client.HGet(t.Context(), keys[9], "releaseFence").Val(); fence != "closed" {
+		t.Fatalf("release fence = %q, want closed", fence)
+	}
+	if count := r.client.HLen(t.Context(), keys[9]).Val(); count != 14 {
+		t.Fatalf("released source field count = %d, want 14", count)
+	}
+	if exists := r.client.Exists(t.Context(), keys[10]).Val(); exists != 0 {
+		t.Fatalf("released task exists: %d", exists)
+	}
+}
+
 func TestEnqueueReceiverTargetTaskHashBoundary(t *testing.T) {
 	r := setup(t)
 	defer r.Close()
