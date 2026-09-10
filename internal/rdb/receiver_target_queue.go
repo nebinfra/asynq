@@ -1,8 +1,82 @@
 package rdb
 
-import "github.com/redis/go-redis/v9"
+import (
+	"context"
+	"fmt"
+
+	"github.com/nebinfra/asynq/internal/errors"
+	"github.com/redis/go-redis/v9"
+)
 
 const receiverTargetMaximumQueueScore = 9007199254740991
+
+const (
+	receiverTargetQueueKeyCount     = 24
+	receiverTargetQueueOperandCount = 20
+)
+
+var receiverTargetQueueCmd = redis.NewScript(receiverTargetQueueSource)
+
+type receiverTargetTaskCASResult struct {
+	targetRevision string
+	resultPayload  string
+	replayed       bool
+}
+
+// applyReceiverTargetTaskCAS is the sole invocation boundary for the generated
+// receiver transaction. Fixed arrays keep the generated key and operand grammar
+// exact at every caller.
+func (r *RDB) applyReceiverTargetTaskCAS(
+	ctx context.Context,
+	op errors.Op,
+	keys [receiverTargetQueueKeyCount]string,
+	operands [receiverTargetQueueOperandCount]string,
+) (receiverTargetTaskCASResult, error) {
+	args := make([]interface{}, len(operands))
+	for i := range operands {
+		args[i] = operands[i]
+	}
+	value, err := receiverTargetQueueCmd.Run(ctx, r.client, keys[:], args...).Result()
+	if err != nil {
+		return receiverTargetTaskCASResult{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
+	}
+	return parseReceiverTargetTaskCASResult(op, value)
+}
+
+func parseReceiverTargetTaskCASResult(op errors.Op, value interface{}) (receiverTargetTaskCASResult, error) {
+	items, ok := value.([]interface{})
+	if !ok || len(items) < 1 {
+		return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction result: %v", value))
+	}
+	status, ok := items[0].(string)
+	if !ok {
+		return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction result: %v", value))
+	}
+	if status == "refused" {
+		if len(items) != 2 {
+			return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction refusal: %v", value))
+		}
+		reason, ok := items[1].(string)
+		if !ok || reason == "" {
+			return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction refusal: %v", value))
+		}
+		return receiverTargetTaskCASResult{}, errors.E(op, errors.FailedPrecondition, reason)
+	}
+	if status != "ok" || len(items) != 4 {
+		return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction result: %v", value))
+	}
+	targetRevision, revisionOK := items[1].(string)
+	resultPayload, payloadOK := items[2].(string)
+	replay, replayOK := items[3].(string)
+	if !revisionOK || targetRevision == "" || !payloadOK || resultPayload == "" || !replayOK || replay != "0" && replay != "1" {
+		return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction result: %v", value))
+	}
+	return receiverTargetTaskCASResult{
+		targetRevision: targetRevision,
+		resultPayload:  resultPayload,
+		replayed:       replay == "1",
+	}, nil
+}
 
 var receiverTargetEnqueueCmd = redis.NewScript(`
 if redis.call("EXISTS", KEYS[1]) == 1 then
