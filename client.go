@@ -60,6 +60,7 @@ const (
 	TaskIDOpt
 	RetentionOpt
 	GroupOpt
+	ReceiverTargetQueueInitialOpt
 )
 
 // Option specifies the task processing behavior.
@@ -76,17 +77,44 @@ type Option interface {
 
 // Internal option representations.
 type (
-	retryOption     int
-	queueOption     string
-	taskIDOption    string
-	timeoutOption   time.Duration
-	deadlineOption  time.Time
-	uniqueOption    time.Duration
-	processAtOption time.Time
-	processInOption time.Duration
-	retentionOption time.Duration
-	groupOption     string
+	retryOption                      int
+	queueOption                      string
+	taskIDOption                     string
+	timeoutOption                    time.Duration
+	deadlineOption                   time.Time
+	uniqueOption                     time.Duration
+	processAtOption                  time.Time
+	processInOption                  time.Duration
+	retentionOption                  time.Duration
+	groupOption                      string
+	receiverTargetQueueInitialOption ReceiverTargetQueueInitial
 )
+
+// ReceiverTargetQueueInitial identifies one trusted queue effect for marked
+// initial admission. The broker derives all physical keys and the fixed variant.
+type ReceiverTargetQueueInitial struct {
+	RuntimeEpochRevision string
+	StateEpoch           string
+	CatalogGeneration    string
+	InstanceTenant       string
+	EffectID             string
+	SourceIDDigest       string
+	TaskDigest           string
+}
+
+// WithReceiverTargetQueueInitial marks one enqueue for the generated receiver
+// transaction. It is valid only for the default queue without Unique or Group.
+func WithReceiverTargetQueueInitial(input ReceiverTargetQueueInitial) Option {
+	return receiverTargetQueueInitialOption(input)
+}
+
+func (input receiverTargetQueueInitialOption) String() string {
+	return "WithReceiverTargetQueueInitial()"
+}
+func (input receiverTargetQueueInitialOption) Type() OptionType { return ReceiverTargetQueueInitialOpt }
+func (input receiverTargetQueueInitialOption) Value() interface{} {
+	return ReceiverTargetQueueInitial(input)
+}
 
 // MaxRetry returns an option to specify the max number of times
 // the task will be retried.
@@ -228,15 +256,16 @@ var ErrDuplicateTask = errors.New("task already exists")
 var ErrTaskIDConflict = errors.New("task ID conflicts with another task")
 
 type option struct {
-	retry     int
-	queue     string
-	taskID    string
-	timeout   time.Duration
-	deadline  time.Time
-	uniqueTTL time.Duration
-	processAt time.Time
-	retention time.Duration
-	group     string
+	retry                      int
+	queue                      string
+	taskID                     string
+	timeout                    time.Duration
+	deadline                   time.Time
+	uniqueTTL                  time.Duration
+	processAt                  time.Time
+	retention                  time.Duration
+	group                      string
+	receiverTargetQueueInitial *base.ReceiverTargetQueueInitial
 }
 
 // composeOptions merges user provided options into the default options
@@ -290,6 +319,17 @@ func composeOptions(opts ...Option) (option, error) {
 				return option{}, errors.New("group key cannot be empty")
 			}
 			res.group = key
+		case receiverTargetQueueInitialOption:
+			value := base.ReceiverTargetQueueInitial{
+				RuntimeEpochRevision: opt.RuntimeEpochRevision,
+				StateEpoch:           opt.StateEpoch,
+				CatalogGeneration:    opt.CatalogGeneration,
+				InstanceTenant:       opt.InstanceTenant,
+				EffectID:             opt.EffectID,
+				SourceIDDigest:       opt.SourceIDDigest,
+				TaskDigest:           opt.TaskDigest,
+			}
+			res.receiverTargetQueueInitial = &value
 		default:
 			// ignore unexpected option
 		}
@@ -396,7 +436,19 @@ func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option)
 	}
 	now := time.Now()
 	var state base.TaskState
-	if opt.processAt.After(now) {
+	if opt.receiverTargetQueueInitial != nil {
+		if opt.queue != base.DefaultQueueName || opt.uniqueTTL != 0 || opt.group != "" {
+			return nil, errors.New("receiver target queue admission requires the plain default queue")
+		}
+		input := *opt.receiverTargetQueueInitial
+		input.ProcessAt = opt.processAt
+		err = c.broker.EnqueueReceiverTarget(ctx, msg, input)
+		if opt.processAt.After(now) {
+			state = base.TaskStateScheduled
+		} else {
+			state = base.TaskStatePending
+		}
+	} else if opt.processAt.After(now) {
 		err = c.schedule(ctx, msg, opt.processAt, opt.uniqueTTL)
 		state = base.TaskStateScheduled
 	} else if opt.group != "" {

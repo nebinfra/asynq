@@ -7,6 +7,7 @@ package asynq
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,25 @@ import (
 	h "github.com/nebinfra/asynq/internal/testutil"
 	"github.com/redis/go-redis/v9"
 )
+
+func TestComposeReceiverTargetQueueInitialOption(t *testing.T) {
+	want := ReceiverTargetQueueInitial{
+		RuntimeEpochRevision: "7",
+		StateEpoch:           "3",
+		CatalogGeneration:    strings.Repeat("a", 64),
+		InstanceTenant:       "nebcore",
+		EffectID:             "effect",
+		SourceIDDigest:       strings.Repeat("b", 64),
+		TaskDigest:           strings.Repeat("c", 64),
+	}
+	got, err := composeOptions(WithReceiverTargetQueueInitial(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.receiverTargetQueueInitial == nil || got.receiverTargetQueueInitial.RuntimeEpochRevision != want.RuntimeEpochRevision || got.receiverTargetQueueInitial.SourceIDDigest != want.SourceIDDigest {
+		t.Fatalf("receiver target option = %+v", got.receiverTargetQueueInitial)
+	}
+}
 
 func TestClientEnqueueWithProcessAtOption(t *testing.T) {
 	r := setup(t)

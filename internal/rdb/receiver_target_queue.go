@@ -2,8 +2,15 @@ package rdb
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"math"
+	"strconv"
+	"strings"
+	"time"
 
+	"github.com/nebinfra/asynq/internal/base"
 	"github.com/nebinfra/asynq/internal/errors"
 	"github.com/redis/go-redis/v9"
 )
@@ -21,6 +28,142 @@ type receiverTargetTaskCASResult struct {
 	targetRevision string
 	resultPayload  string
 	replayed       bool
+}
+
+func (r *RDB) EnqueueReceiverTarget(ctx context.Context, msg *base.TaskMessage, input base.ReceiverTargetQueueInitial) error {
+	const op errors.Op = "rdb.EnqueueReceiverTarget"
+	encoded, err := base.EncodeMessage(msg)
+	if err != nil {
+		return errors.E(op, errors.Unknown, fmt.Sprintf("cannot encode message: %v", err))
+	}
+	keys, operands, err := r.receiverTargetInitialCommand(ctx, msg, encoded, input)
+	if err != nil {
+		return errors.E(op, errors.FailedPrecondition, err)
+	}
+	result, err := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
+	if err != nil {
+		return err
+	}
+	if result.replayed {
+		operands[7] = "finalize"
+		if _, finalizeErr := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands); finalizeErr == nil {
+			return nil
+		}
+	}
+	operands[7] = "settle"
+	if _, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands); err != nil {
+		return err
+	}
+	operands[7] = "finalize"
+	_, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
+	return err
+}
+
+func (r *RDB) receiverTargetInitialCommand(ctx context.Context, msg *base.TaskMessage, encoded []byte, input base.ReceiverTargetQueueInitial) ([receiverTargetQueueKeyCount]string, [receiverTargetQueueOperandCount]string, error) {
+	var keys [receiverTargetQueueKeyCount]string
+	var operands [receiverTargetQueueOperandCount]string
+	if msg == nil || msg.Queue != base.DefaultQueueName || msg.ID == "" || len(msg.ID) > 256 || len(encoded) == 0 || len(encoded) > 271559 ||
+		!receiverTargetPositiveUint(input.RuntimeEpochRevision) || !receiverTargetPositiveUint(input.StateEpoch) || len(input.CatalogGeneration) != 64 || len(input.InstanceTenant) == 0 || len(input.InstanceTenant) > 63 ||
+		len(input.EffectID) == 0 || len(input.EffectID) > 128 || !receiverTargetDigest(input.SourceIDDigest) || !receiverTargetDigest(input.TaskDigest) {
+		return keys, operands, fmt.Errorf("invalid initial receiver input")
+	}
+	sourceID := receiverTargetInitialSourceID(input, msg.ID)
+	sourceDigest := receiverTargetInitialEvidenceDigest(sourceID, input.TaskDigest)
+	receiptIdentity := receiverTargetReceiptIdentity(input.StateEpoch, input.InstanceTenant, sourceID)
+	state, next, score, err := r.receiverTargetInitialPlacement(ctx, input.ProcessAt)
+	if err != nil {
+		return keys, operands, err
+	}
+	sourceFields := []string{"sourceIdDigest", "stateEpoch", "enqueueGeneration", "reservedBytes", "taskDigest", "releaseFence", "targetRevision", "sourceEnqueueGeneration", "nativeExpiry", "sourceNativeExpiry", "receiptIdentityDigest"}
+	sourceValues := []string{input.SourceIDDigest, input.StateEpoch, "1", "4096", input.TaskDigest, "open", "1", "1", "", "", receiptIdentity}
+	taskFields := []string{"msg", "state", "sourceIdDigest", "stateEpoch", "enqueueGeneration", "taskDigest"}
+	taskValues := []string{string(encoded), state, input.SourceIDDigest, input.StateEpoch, "1", input.TaskDigest}
+	if state == "pending" {
+		taskFields = append(taskFields, "pending_since")
+		taskValues = append(taskValues, next)
+	}
+	rows := int64(len(sourceFields) + len(taskFields) + 1)
+	bytes := receiverTargetHashBytes(sourceFields, sourceValues) + receiverTargetHashBytes(taskFields, taskValues) + int64(len(msg.ID)+len(score))
+	epoch := input.StateEpoch
+	keys = [receiverTargetQueueKeyCount]string{
+		"nebpilot:runtime:epoch",
+		"nebpilot:e:" + epoch + ":receiver-target:active",
+		"nebpilot:e:" + epoch + ":receiver-target:active-revision",
+		"nebpilot:e:" + epoch + ":receiver-target:advancement:queueWakeup",
+		"nebpilot:e:" + epoch + ":receiver-target:capacity",
+		"nebpilot:e:" + epoch + ":receiver-target:receipt:" + receiptIdentity,
+		"nebpilot:e:" + epoch + ":receiver-target:queue-ack:" + receiptIdentity,
+		"nebpilot:e:" + epoch + ":effects:body:" + input.EffectID,
+		"nebpilot:e:" + epoch + ":effects:receiver-inbox:body:" + input.EffectID,
+		"nebpilot:e:" + epoch + ":receiver-target:queue-reservation:" + input.SourceIDDigest + ":" + msg.ID,
+		base.TaskKey(base.DefaultQueueName, msg.ID), base.PendingKey(base.DefaultQueueName), base.ActiveKey(base.DefaultQueueName), base.ScheduledKey(base.DefaultQueueName), base.RetryKey(base.DefaultQueueName), base.ArchivedKey(base.DefaultQueueName), base.CompletedKey(base.DefaultQueueName), base.LeaseKey(base.DefaultQueueName), base.AllQueues, base.PausedKey(base.DefaultQueueName), base.ProcessedKey(base.DefaultQueueName, input.ProcessAt), base.ProcessedTotalKey(base.DefaultQueueName), base.FailedKey(base.DefaultQueueName, input.ProcessAt), base.FailedTotalKey(base.DefaultQueueName),
+	}
+	operands = [receiverTargetQueueOperandCount]string{sourceID, sourceDigest, input.RuntimeEpochRevision, input.CatalogGeneration, input.InstanceTenant, "0", receiptIdentity, "initial-enqueue", state, input.TaskDigest, "", "", string(encoded), next, strconv.FormatInt(rows, 10), strconv.FormatInt(bytes, 10), "0", "", "", "0"}
+	return keys, operands, nil
+}
+
+func (r *RDB) receiverTargetInitialPlacement(ctx context.Context, processAt time.Time) (state, next, score string, err error) {
+	if processAt.After(r.clock.Now()) {
+		score = strconv.FormatInt(processAt.Unix(), 10)
+		return "scheduled", score, score, nil
+	}
+	tail, err := r.client.ZRevRangeWithScores(ctx, base.PendingKey(base.DefaultQueueName), 0, 0).Result()
+	if err != nil {
+		return "", "", "", err
+	}
+	value := int64(0)
+	if len(tail) != 0 {
+		if len(tail) != 1 || tail[0].Score != math.Trunc(tail[0].Score) || tail[0].Score < -receiverTargetMaximumQueueScore || tail[0].Score >= receiverTargetMaximumQueueScore {
+			return "", "", "", fmt.Errorf("queue score exhausted")
+		}
+		raw := strconv.FormatInt(int64(tail[0].Score), 10)
+		count, countErr := r.client.ZCount(ctx, base.PendingKey(base.DefaultQueueName), raw, raw).Result()
+		if countErr != nil || count != 1 {
+			return "", "", "", fmt.Errorf("queue score is not unique")
+		}
+		value = int64(tail[0].Score) + 1
+	}
+	return "pending", strconv.FormatInt(r.clock.Now().UnixNano(), 10), strconv.FormatInt(value, 10), nil
+}
+
+func receiverTargetInitialSourceID(input base.ReceiverTargetQueueInitial, taskID string) string {
+	return `{"enqueueGeneration":"1","effectId":` + strconv.Quote(input.EffectID) + `,"kind":"initial","schemaVersion":"queue-wakeup.source.v1","sourceIdDigest":"` + input.SourceIDDigest + `","stateEpoch":"` + input.StateEpoch + `","targetRevision":"0","taskId":` + strconv.Quote(taskID) + `}`
+}
+
+func receiverTargetInitialEvidenceDigest(sourceID, taskDigest string) string {
+	value := `{"ackOperationDigest":"","ackReceiptDigest":"","releaseFence":"open","reservedBytes":"4096","schemaVersion":"queue-wakeup.initial-evidence.v1","sourceIdentity":` + strconv.Quote(sourceID) + `,"taskDigest":"` + taskDigest + `"}`
+	return receiverTargetSHA256(value)
+}
+
+func receiverTargetReceiptIdentity(stateEpoch, tenant, sourceID string) string {
+	value := `{"command":"Apply","family":"queueWakeup","instanceTenant":` + strconv.Quote(tenant) + `,"schemaVersion":"receiver-target.receipt-identity.v1","sourceId":` + strconv.Quote(sourceID) + `,"sourceKind":"effect_inbox","stateEpoch":` + stateEpoch + `,"variant":"enqueue_fenced"}`
+	return receiverTargetSHA256(value)
+}
+
+func receiverTargetSHA256(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
+func receiverTargetDigest(value string) bool {
+	if len(value) != 64 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func receiverTargetPositiveUint(value string) bool {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	return err == nil && parsed != 0 && strconv.FormatUint(parsed, 10) == value
+}
+
+func receiverTargetHashBytes(fields, values []string) int64 {
+	var total int64
+	for i := range fields {
+		total += int64(len(fields[i]) + len(values[i]))
+	}
+	return total
 }
 
 // applyReceiverTargetTaskCAS is the sole invocation boundary for the generated
@@ -59,6 +202,9 @@ func parseReceiverTargetTaskCASResult(op errors.Op, value interface{}) (receiver
 		reason, ok := items[1].(string)
 		if !ok || reason == "" {
 			return receiverTargetTaskCASResult{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver transaction refusal: %v", value))
+		}
+		if reason == "target-revision" {
+			return receiverTargetTaskCASResult{}, errors.E(op, errors.AlreadyExists, errors.ErrTaskIdConflict)
 		}
 		return receiverTargetTaskCASResult{}, errors.E(op, errors.FailedPrecondition, reason)
 	}
