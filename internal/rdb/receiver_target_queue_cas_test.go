@@ -181,6 +181,28 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 	if exists := r.client.Exists(t.Context(), keys[10]).Val(); exists != 0 {
 		t.Fatalf("marked task exists after done: %d", exists)
 	}
+	beforeRevision := r.client.HGet(t.Context(), keys[9], "targetRevision").Val()
+	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
+		t.Fatalf("marked recovery enqueue: %v", err)
+	}
+	recovered := r.client.HGetAll(t.Context(), keys[10]).Val()
+	if recovered["state"] != "pending" || recovered["enqueueGeneration"] != "2" {
+		t.Fatalf("recovered task fields = %#v", recovered)
+	}
+	afterRevision := r.client.HGet(t.Context(), keys[9], "targetRevision").Val()
+	wantRevision, err := receiverTargetIncrementUint(beforeRevision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRevision != wantRevision {
+		t.Fatalf("recovery target revision = %q, want %q", afterRevision, wantRevision)
+	}
+	if generation := r.client.HGet(t.Context(), keys[9], "enqueueGeneration").Val(); generation != "2" {
+		t.Fatalf("recovery source generation = %q, want 2", generation)
+	}
+	if score, err := r.client.ZScore(t.Context(), keys[11], msg.ID).Result(); err != nil || score != 0 {
+		t.Fatalf("recovered pending score = %v, %v", score, err)
+	}
 }
 
 func TestEnqueueReceiverTargetTaskHashBoundary(t *testing.T) {

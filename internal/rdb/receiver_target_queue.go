@@ -87,6 +87,14 @@ func (r *RDB) EnqueueReceiverTarget(ctx context.Context, msg *base.TaskMessage, 
 	if err != nil {
 		return errors.E(op, errors.FailedPrecondition, err)
 	}
+	keys, operands, err = r.receiverTargetRecoveryCommand(ctx, msg, encoded, input, keys, operands)
+	if err != nil {
+		return errors.E(op, errors.FailedPrecondition, err)
+	}
+	return r.executeReceiverTargetTaskCAS(ctx, op, keys, operands)
+}
+
+func (r *RDB) executeReceiverTargetTaskCAS(ctx context.Context, op errors.Op, keys [receiverTargetQueueKeyCount]string, operands [receiverTargetQueueOperandCount]string) error {
 	result, err := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
 	if err != nil {
 		return err
@@ -104,6 +112,69 @@ func (r *RDB) EnqueueReceiverTarget(ctx context.Context, msg *base.TaskMessage, 
 	operands[7] = "finalize"
 	_, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
 	return err
+}
+
+func (r *RDB) receiverTargetRecoveryCommand(
+	ctx context.Context,
+	msg *base.TaskMessage,
+	encoded []byte,
+	input base.ReceiverTargetQueueInitial,
+	keys [receiverTargetQueueKeyCount]string,
+	operands [receiverTargetQueueOperandCount]string,
+) ([receiverTargetQueueKeyCount]string, [receiverTargetQueueOperandCount]string, error) {
+	taskExists, err := r.client.Exists(ctx, keys[10]).Result()
+	if err != nil || taskExists != 0 {
+		return keys, operands, err
+	}
+	sourceCount, err := r.client.HLen(ctx, keys[9]).Result()
+	if err != nil || sourceCount == 0 {
+		return keys, operands, err
+	}
+	source, err := r.receiverTargetFinalizedSource(ctx, keys[9])
+	if err != nil {
+		return keys, operands, err
+	}
+	if source.sourceIDDigest != input.SourceIDDigest || source.stateEpoch != input.StateEpoch || source.taskDigest != input.TaskDigest || source.releaseFence != "open" {
+		return keys, operands, fmt.Errorf("recovery source mismatch")
+	}
+	nextGeneration, err := receiverTargetIncrementUint(source.enqueueGeneration)
+	if err != nil {
+		return keys, operands, err
+	}
+	nextRevision, err := receiverTargetIncrementUint(source.targetRevision)
+	if err != nil {
+		return keys, operands, err
+	}
+	frame := receiverTargetSuccessorSourceID(source, input.EffectID, msg.ID)
+	evidence := receiverTargetSuccessorEvidenceDigest(frame, source)
+	receipt := receiverTargetOperationReceiptIdentity(source.stateEpoch, input.InstanceTenant, frame, "Apply", "enqueue_fenced", "existing_source_revision")
+	keys[5] = "nebpilot:e:" + source.stateEpoch + ":receiver-target:receipt:" + receipt
+	keys[6] = "nebpilot:e:" + source.stateEpoch + ":receiver-target:queue-ack:" + receipt
+
+	taskFields := []string{"msg", "state", "sourceIdDigest", "stateEpoch", "enqueueGeneration", "taskDigest"}
+	taskValues := []string{string(encoded), operands[8], source.sourceIDDigest, source.stateEpoch, nextGeneration, source.taskDigest}
+	if operands[8] == "pending" {
+		taskFields = append(taskFields, "pending_since")
+		taskValues = append(taskValues, operands[13])
+	}
+	if receiverTargetHashBytes(taskFields, taskValues) > receiverTargetMaximumTaskHashBytes {
+		return keys, operands, fmt.Errorf("marked task hash exceeds maximum")
+	}
+	afterSourceFields := []string{"sourceIdDigest", "stateEpoch", "enqueueGeneration", "reservedBytes", "taskDigest", "releaseFence", "targetRevision", "sourceEnqueueGeneration", "nativeExpiry", "sourceNativeExpiry", "predecessorAckReceiptDigest", "predecessorAckOperationDigest", "receiptIdentityDigest"}
+	afterSourceValues := []string{source.sourceIDDigest, source.stateEpoch, nextGeneration, "4096", source.taskDigest, "open", nextRevision, source.enqueueGeneration, "", source.nativeExpiry, source.ackReceipt, source.ackOperation, receipt}
+	score := operands[13]
+	if operands[8] == "pending" {
+		score, err = r.receiverTargetEndpointScore(ctx, keys[11], true)
+		if err != nil {
+			return keys, operands, err
+		}
+	}
+	afterRows := int64(len(afterSourceFields) + len(taskFields) + 1)
+	afterBytes := receiverTargetHashBytes(afterSourceFields, afterSourceValues) + receiverTargetHashBytes(taskFields, taskValues) + int64(len(msg.ID)+len(score))
+	operands[0], operands[1], operands[5], operands[6], operands[7] = frame, evidence, source.targetRevision, receipt, "recovery-enqueue"
+	operands[14] = strconv.FormatInt(afterRows-int64(len(source.fields)), 10)
+	operands[15] = strconv.FormatInt(afterBytes-receiverTargetHashBytes(source.fields, source.values), 10)
+	return keys, operands, nil
 }
 
 func (r *RDB) receiverTargetInitialCommand(ctx context.Context, msg *base.TaskMessage, encoded []byte, input base.ReceiverTargetQueueInitial) ([receiverTargetQueueKeyCount]string, [receiverTargetQueueOperandCount]string, error) {
@@ -270,23 +341,7 @@ func (r *RDB) applyReceiverTargetNative(ctx context.Context, op errors.Op, msg *
 		return errors.E(op, errors.FailedPrecondition, err)
 	}
 	operands[14], operands[15], operands[16] = delta[0], delta[1], delta[2]
-	result, err := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
-	if err != nil {
-		return err
-	}
-	if result.replayed {
-		operands[7] = "finalize"
-		if _, finalizeErr := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands); finalizeErr == nil {
-			return nil
-		}
-	}
-	operands[7] = "settle"
-	if _, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands); err != nil {
-		return err
-	}
-	operands[7] = "finalize"
-	_, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
-	return err
+	return r.executeReceiverTargetTaskCAS(ctx, op, keys, operands)
 }
 
 func (r *RDB) receiverTargetNativeSnapshot(ctx context.Context, msg *base.TaskMessage) (receiverTargetNativeTask, receiverTargetNativeSource, [5]string, receiverTargetQueueEnvelope, [receiverTargetQueueKeyCount]string, error) {
@@ -340,25 +395,11 @@ func (r *RDB) receiverTargetNativeSnapshot(ctx context.Context, msg *base.TaskMe
 		return task, source, epoch, envelope, keys, fmt.Errorf("runtime epoch mismatch")
 	}
 	sourceKey := "nebpilot:e:" + taskValues[3] + ":receiver-target:queue-reservation:" + taskValues[2] + ":" + msg.ID
-	sourceCount, err := r.client.HLen(ctx, sourceKey).Result()
-	if err != nil || sourceCount != 12 && sourceCount != 14 {
-		return task, source, epoch, envelope, keys, fmt.Errorf("invalid finalized source shape")
-	}
-	sourceFields := []string{"sourceIdDigest", "stateEpoch", "enqueueGeneration", "reservedBytes", "taskDigest", "releaseFence", "targetRevision", "sourceEnqueueGeneration", "nativeExpiry", "sourceNativeExpiry"}
-	if sourceCount == 14 {
-		sourceFields = append(sourceFields, "predecessorAckReceiptDigest", "predecessorAckOperationDigest")
-	}
-	sourceFields = append(sourceFields, "ackReceiptDigest", "ackOperationDigest")
-	sourceValues, err := receiverTargetHMGetStrings(ctx, r.client, sourceKey, sourceFields)
+	source, err = r.receiverTargetFinalizedSource(ctx, sourceKey)
 	if err != nil {
-		return task, source, epoch, envelope, keys, fmt.Errorf("read finalized source: %w", err)
+		return task, source, epoch, envelope, keys, err
 	}
-	source = receiverTargetNativeSource{
-		fields: sourceFields, values: sourceValues, sourceIDDigest: sourceValues[0], stateEpoch: sourceValues[1], enqueueGeneration: sourceValues[2],
-		taskDigest: sourceValues[4], releaseFence: sourceValues[5], targetRevision: sourceValues[6], nativeExpiry: sourceValues[8],
-		ackReceipt: sourceValues[len(sourceValues)-2], ackOperation: sourceValues[len(sourceValues)-1],
-	}
-	if source.sourceIDDigest != taskValues[2] || source.stateEpoch != taskValues[3] || source.enqueueGeneration != taskValues[4] || source.values[3] != "4096" || source.taskDigest != taskValues[5] || source.releaseFence != "open" || !receiverTargetPositiveUint(source.targetRevision) || !receiverTargetPositiveUint(source.values[7]) || !receiverTargetOptionalPositiveUint(source.nativeExpiry) || !receiverTargetOptionalPositiveUint(source.values[9]) || !receiverTargetDigest(source.ackReceipt) || !receiverTargetDigest(source.ackOperation) {
+	if source.sourceIDDigest != taskValues[2] || source.stateEpoch != taskValues[3] || source.enqueueGeneration != taskValues[4] || source.taskDigest != taskValues[5] {
 		return task, source, epoch, envelope, keys, fmt.Errorf("finalized source mismatch")
 	}
 	epochID := source.stateEpoch
@@ -368,6 +409,35 @@ func (r *RDB) receiverTargetNativeSnapshot(ctx context.Context, msg *base.TaskMe
 		taskKey, base.PendingKey(msg.Queue), base.ActiveKey(msg.Queue), base.ScheduledKey(msg.Queue), base.RetryKey(msg.Queue), base.ArchivedKey(msg.Queue), base.CompletedKey(msg.Queue), base.LeaseKey(msg.Queue), base.AllQueues, base.PausedKey(msg.Queue), "", base.ProcessedTotalKey(msg.Queue), "", base.FailedTotalKey(msg.Queue),
 	}
 	return task, source, epoch, envelope, keys, nil
+}
+
+func (r *RDB) receiverTargetFinalizedSource(ctx context.Context, sourceKey string) (receiverTargetNativeSource, error) {
+	var source receiverTargetNativeSource
+	sourceCount, err := r.client.HLen(ctx, sourceKey).Result()
+	if err != nil || sourceCount != 12 && sourceCount != 14 {
+		return source, fmt.Errorf("invalid finalized source shape")
+	}
+	sourceFields := []string{"sourceIdDigest", "stateEpoch", "enqueueGeneration", "reservedBytes", "taskDigest", "releaseFence", "targetRevision", "sourceEnqueueGeneration", "nativeExpiry", "sourceNativeExpiry"}
+	if sourceCount == 14 {
+		sourceFields = append(sourceFields, "predecessorAckReceiptDigest", "predecessorAckOperationDigest")
+	}
+	sourceFields = append(sourceFields, "ackReceiptDigest", "ackOperationDigest")
+	sourceValues, err := receiverTargetHMGetStrings(ctx, r.client, sourceKey, sourceFields)
+	if err != nil {
+		return source, fmt.Errorf("read finalized source: %w", err)
+	}
+	source = receiverTargetNativeSource{
+		fields: sourceFields, values: sourceValues, sourceIDDigest: sourceValues[0], stateEpoch: sourceValues[1], enqueueGeneration: sourceValues[2],
+		taskDigest: sourceValues[4], releaseFence: sourceValues[5], targetRevision: sourceValues[6], nativeExpiry: sourceValues[8],
+		ackReceipt: sourceValues[len(sourceValues)-2], ackOperation: sourceValues[len(sourceValues)-1],
+	}
+	if !receiverTargetDigest(source.sourceIDDigest) || !receiverTargetPositiveUint(source.stateEpoch) || !receiverTargetPositiveUint(source.enqueueGeneration) || source.values[3] != "4096" || !receiverTargetDigest(source.taskDigest) || source.releaseFence != "open" || !receiverTargetPositiveUint(source.targetRevision) || !receiverTargetPositiveUint(source.values[7]) || !receiverTargetOptionalPositiveUint(source.nativeExpiry) || !receiverTargetOptionalPositiveUint(source.values[9]) || !receiverTargetDigest(source.ackReceipt) || !receiverTargetDigest(source.ackOperation) {
+		return source, fmt.Errorf("invalid finalized source values")
+	}
+	if sourceCount == 14 && (!receiverTargetDigest(sourceValues[10]) || !receiverTargetDigest(sourceValues[11])) {
+		return source, fmt.Errorf("invalid predecessor acknowledgement")
+	}
+	return source, nil
 }
 
 func receiverTargetHMGetStrings(ctx context.Context, client redis.UniversalClient, key string, fields []string) ([]string, error) {
