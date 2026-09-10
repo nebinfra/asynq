@@ -907,6 +907,9 @@ const (
 // ARGV[6] -> stats expiration timestamp
 // ARGV[7] -> max int64 value
 var archiveCmd = redis.NewScript(`
+if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
+  return redis.error_reply("RECEIVER TARGET ARCHIVE UNSUPPORTED")
+end
 local removed
 if redis.call("TYPE", KEYS[2]).ok == "zset" then
   removed = redis.call("ZREM", KEYS[2], ARGV[1])

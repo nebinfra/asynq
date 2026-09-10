@@ -2,6 +2,7 @@ package rdb
 
 import (
 	"context"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/nebinfra/asynq/internal/base"
 	"github.com/nebinfra/asynq/internal/errors"
 	"github.com/nebinfra/asynq/internal/timeutil"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestParseReceiverTargetTaskCASResult(t *testing.T) {
@@ -185,6 +187,62 @@ func TestEnqueueReceiverTargetTaskHashBoundary(t *testing.T) {
 	if got := receiverTargetMapHashBytes(fields); got != receiverTargetMaximumTaskHashBytes {
 		t.Fatalf("stored task hash bytes = %d, want %d", got, receiverTargetMaximumTaskHashBytes)
 	}
+}
+
+func TestArchiveRefusesMarkedTaskWithoutWrites(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	ctx := t.Context()
+	now := time.Unix(1725148800, 123)
+	r.SetClock(timeutil.NewSimulatedClock(now))
+	msg := &base.TaskMessage{ID: "advance:task", Type: "nebpilot:advance", Payload: []byte(`{"effectId":"fixture"}`), Queue: base.DefaultQueueName, Retry: 3}
+	encoded, err := base.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskKey := base.TaskKey(msg.Queue, msg.ID)
+	fields := map[string]any{
+		"msg":               string(encoded),
+		"state":             "active",
+		"sourceIdDigest":    strings.Repeat("a", 64),
+		"stateEpoch":        "9",
+		"enqueueGeneration": "1",
+		"taskDigest":        strings.Repeat("b", 64),
+	}
+	if err := r.client.HSet(ctx, taskKey, fields).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.ZAdd(ctx, base.ActiveKey(msg.Queue), redis.Z{Score: 0, Member: msg.ID}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	lease := now.Add(LeaseDuration).Unix()
+	if err := r.client.ZAdd(ctx, base.LeaseKey(msg.Queue), redis.Z{Score: float64(lease), Member: msg.ID}).Err(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := r.Archive(ctx, msg, "failed"); err == nil || !strings.Contains(err.Error(), "RECEIVER TARGET ARCHIVE UNSUPPORTED") {
+		t.Fatalf("marked archive error = %v, want unsupported refusal", err)
+	}
+	if got := r.client.HGetAll(ctx, taskKey).Val(); !reflect.DeepEqual(got, mapStringAnyToString(fields)) {
+		t.Fatalf("marked task changed after archive refusal: %#v", got)
+	}
+	if score := r.client.ZScore(ctx, base.ActiveKey(msg.Queue), msg.ID).Val(); score != 0 {
+		t.Fatalf("active score = %v, want 0", score)
+	}
+	if score := r.client.ZScore(ctx, base.LeaseKey(msg.Queue), msg.ID).Val(); score != float64(lease) {
+		t.Fatalf("lease score = %v, want %d", score, lease)
+	}
+	if count := r.client.ZCard(ctx, base.ArchivedKey(msg.Queue)).Val(); count != 0 {
+		t.Fatalf("archived count = %d, want 0", count)
+	}
+}
+
+func mapStringAnyToString(input map[string]any) map[string]string {
+	output := make(map[string]string, len(input))
+	for key, value := range input {
+		output[key] = value.(string)
+	}
+	return output
 }
 
 func receiverTargetInitialFixture(now time.Time) base.ReceiverTargetQueueInitial {
