@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"sync"
 	"time"
 
@@ -276,6 +277,28 @@ func (r *RDB) Dequeue(qnames ...string) (msg *base.TaskMessage, leaseExpirationT
 		} else if err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Unknown, fmt.Sprintf("redis eval error: %v", err))
 		}
+		if selected, ok := res.([]interface{}); ok {
+			if qname != base.DefaultQueueName || len(selected) != 4 || selected[0] != "receiver-target" {
+				return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver dequeue result: %v", res))
+			}
+			id, idOK := selected[1].(string)
+			pendingScore, scoreOK := selected[2].(string)
+			encoded, messageOK := selected[3].(string)
+			if !idOK || !scoreOK || !messageOK {
+				return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("unexpected receiver dequeue result: %v", res))
+			}
+			selectedMessage, decodeErr := base.DecodeMessage([]byte(encoded))
+			if decodeErr != nil || selectedMessage.ID != id || selectedMessage.Queue != qname {
+				return nil, time.Time{}, errors.E(op, errors.Internal, "invalid receiver dequeue message")
+			}
+			if applyErr := r.applyReceiverTargetNative(context.Background(), op, selectedMessage, receiverTargetNativeCommand{
+				action: "dequeue", expectedState: "pending", expectedDue: pendingScore,
+				nextValue: strconv.FormatInt(leaseExpirationTime.Unix(), 10),
+			}); applyErr != nil {
+				return nil, time.Time{}, applyErr
+			}
+			return selectedMessage, leaseExpirationTime, nil
+		}
 		encoded, err := cast.ToStringE(res)
 		if err != nil {
 			return nil, time.Time{}, errors.E(op, errors.Internal, fmt.Sprintf("cast error: unexpected return value from Lua script: %v", res))
@@ -374,6 +397,20 @@ func (r *RDB) Done(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.Done"
 	now := r.clock.Now()
 	expireAt := now.Add(statsTTL)
+	marked, err := r.receiverTargetTaskMarked(ctx, msg)
+	if err != nil {
+		return errors.E(op, errors.Unknown, fmt.Sprintf("read receiver marker: %v", err))
+	}
+	if marked {
+		lease, readErr := r.receiverTargetMembershipScore(ctx, base.LeaseKey(msg.Queue), msg.ID)
+		if readErr != nil {
+			return errors.E(op, errors.FailedPrecondition, readErr)
+		}
+		return r.applyReceiverTargetNative(ctx, op, msg, receiverTargetNativeCommand{
+			action: "done", expectedState: "active", expectedLease: lease,
+			statisticsDay: now.UTC().Format("2006-01-02"), nativeExpiry: strconv.FormatInt(expireAt.Unix(), 10),
+		})
+	}
 	keys := []string{
 		base.ActiveKey(msg.Queue),
 		base.LeaseKey(msg.Queue),
@@ -486,6 +523,13 @@ return redis.status_reply("OK")
 // It removes a uniqueness lock acquired by the task, if any.
 func (r *RDB) MarkAsComplete(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.MarkAsComplete"
+	marked, markerErr := r.receiverTargetTaskMarked(ctx, msg)
+	if markerErr != nil {
+		return errors.E(op, errors.Unknown, fmt.Sprintf("read receiver marker: %v", markerErr))
+	}
+	if marked {
+		return errors.E(op, errors.FailedPrecondition, "receiver target completion retention unsupported")
+	}
 	now := r.clock.Now()
 	statsExpireAt := now.Add(statsTTL)
 	msg.CompletedAt = now.Unix()
@@ -536,6 +580,20 @@ return redis.status_reply("OK")`)
 // Requeue moves the task from active queue to the specified queue.
 func (r *RDB) Requeue(ctx context.Context, msg *base.TaskMessage) error {
 	var op errors.Op = "rdb.Requeue"
+	marked, err := r.receiverTargetTaskMarked(ctx, msg)
+	if err != nil {
+		return errors.E(op, errors.Unknown, fmt.Sprintf("read receiver marker: %v", err))
+	}
+	if marked {
+		lease, readErr := r.receiverTargetMembershipScore(ctx, base.LeaseKey(msg.Queue), msg.ID)
+		if readErr != nil {
+			return errors.E(op, errors.FailedPrecondition, readErr)
+		}
+		return r.applyReceiverTargetNative(ctx, op, msg, receiverTargetNativeCommand{
+			action: "requeue", expectedState: "active", expectedLease: lease,
+			nextValue: strconv.FormatInt(r.clock.Now().UnixNano(), 10),
+		})
+	}
 	keys := []string{
 		base.ActiveKey(msg.Queue),
 		base.LeaseKey(msg.Queue),
@@ -863,6 +921,21 @@ func (r *RDB) Retry(ctx context.Context, msg *base.TaskMessage, processAt time.T
 		return errors.E(op, errors.Internal, fmt.Sprintf("cannot encode message: %v", err))
 	}
 	expireAt := now.Add(statsTTL)
+	marked, markerErr := r.receiverTargetTaskMarked(ctx, msg)
+	if markerErr != nil {
+		return errors.E(op, errors.Unknown, fmt.Sprintf("read receiver marker: %v", markerErr))
+	}
+	if marked {
+		lease, readErr := r.receiverTargetMembershipScore(ctx, base.LeaseKey(msg.Queue), msg.ID)
+		if readErr != nil {
+			return errors.E(op, errors.FailedPrecondition, readErr)
+		}
+		return r.applyReceiverTargetNative(ctx, op, msg, receiverTargetNativeCommand{
+			action: "retry", expectedState: "active", expectedLease: lease,
+			nextMessage: string(encoded), nextValue: strconv.FormatInt(processAt.Unix(), 10),
+			statisticsDay: now.UTC().Format("2006-01-02"), nativeExpiry: strconv.FormatInt(expireAt.Unix(), 10), isFailure: isFailure,
+		})
+	}
 	keys := []string{
 		base.TaskKey(msg.Queue, msg.ID),
 		base.ActiveKey(msg.Queue),
@@ -907,6 +980,9 @@ const (
 // ARGV[6] -> stats expiration timestamp
 // ARGV[7] -> max int64 value
 var archiveCmd = redis.NewScript(`
+if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
+  return redis.error_reply("RECEIVER TARGET ARCHIVE UNSUPPORTED")
+end
 local removed
 if redis.call("TYPE", KEYS[2]).ok == "zset" then
   removed = redis.call("ZREM", KEYS[2], ARGV[1])
@@ -1051,6 +1127,32 @@ func (r *RDB) forward(delayedKey, pendingKey, taskKeyPrefix, groupKeyPrefix stri
 	res, err := script.Run(context.Background(), r.client, keys, argv...).Result()
 	if err != nil {
 		return 0, errors.E(errors.Internal, fmt.Sprintf("redis eval error: %v", err))
+	}
+	if selected, ok := res.([]interface{}); ok {
+		if pendingKey != base.DefaultQueue || len(selected) != 4 || selected[0] != "receiver-target" {
+			return 0, errors.E(errors.Internal, fmt.Sprintf("unexpected receiver forward result: %v", res))
+		}
+		id, idOK := selected[1].(string)
+		due, dueOK := selected[2].(string)
+		encoded, messageOK := selected[3].(string)
+		if !idOK || !dueOK || !messageOK {
+			return 0, errors.E(errors.Internal, fmt.Sprintf("unexpected receiver forward result: %v", res))
+		}
+		msg, decodeErr := base.DecodeMessage([]byte(encoded))
+		if decodeErr != nil || msg.ID != id || msg.Queue != base.DefaultQueueName {
+			return 0, errors.E(errors.Internal, "invalid receiver forward message")
+		}
+		state := "scheduled"
+		if delayedKey == base.RetryKey(base.DefaultQueueName) {
+			state = "retry"
+		}
+		if applyErr := r.applyReceiverTargetNative(context.Background(), "rdb.ForwardIfReady", msg, receiverTargetNativeCommand{
+			action: "due-forward", expectedState: state, expectedDue: due,
+			nextValue: strconv.FormatInt(now.UnixNano(), 10),
+		}); applyErr != nil {
+			return 0, applyErr
+		}
+		return 1, nil
 	}
 	n, err := cast.ToIntE(res)
 	if err != nil {
@@ -1415,13 +1517,42 @@ func (r *RDB) ListLeaseExpired(cutoff time.Time, qnames ...string) ([]*base.Task
 // It returns a new expiration time if the operation was successful.
 func (r *RDB) ExtendLease(qname string, ids ...string) (expirationTime time.Time, err error) {
 	expireAt := r.clock.Now().Add(LeaseDuration)
-	var zs []redis.Z
+	var ordinary []redis.Z
+	var markedID string
 	for _, id := range ids {
-		zs = append(zs, redis.Z{Member: id, Score: float64(expireAt.Unix())})
+		msg := &base.TaskMessage{ID: id, Queue: qname}
+		marked, markerErr := r.receiverTargetTaskMarked(context.Background(), msg)
+		if markerErr != nil {
+			return time.Time{}, markerErr
+		}
+		if !marked {
+			ordinary = append(ordinary, redis.Z{Member: id, Score: float64(expireAt.Unix())})
+			continue
+		}
+		markedID = id
+	}
+	if markedID != "" && len(ids) != 1 {
+		return time.Time{}, errors.E("rdb.ExtendLease", errors.FailedPrecondition, "receiver target lease extension requires one task")
+	}
+	if markedID != "" {
+		msg := &base.TaskMessage{ID: markedID, Queue: qname}
+		lease, readErr := r.receiverTargetMembershipScore(context.Background(), base.LeaseKey(qname), markedID)
+		if readErr != nil {
+			return time.Time{}, readErr
+		}
+		if applyErr := r.applyReceiverTargetNative(context.Background(), "rdb.ExtendLease", msg, receiverTargetNativeCommand{
+			action: "lease-extension", expectedState: "active", expectedLease: lease,
+			nextValue: strconv.FormatInt(expireAt.Unix(), 10),
+		}); applyErr != nil {
+			return time.Time{}, applyErr
+		}
 	}
 	// Use XX option to only update elements that already exist; Don't add new elements
 	// TODO: Consider adding GT option to ensure we only "extend" the lease. Ceveat is that GT is supported from redis v6.2.0 or above.
-	err = r.client.ZAddXX(context.Background(), base.LeaseKey(qname), zs...).Err()
+	if len(ordinary) == 0 {
+		return expireAt, nil
+	}
+	err = r.client.ZAddXX(context.Background(), base.LeaseKey(qname), ordinary...).Err()
 	if err != nil {
 		return time.Time{}, err
 	}
