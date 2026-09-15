@@ -146,8 +146,12 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 	if digest := r.client.HGet(t.Context(), keys[9], "ackReceiptDigest").Val(); digest == "" {
 		t.Fatal("finalized source has no acknowledgement receipt")
 	}
+	beforeReplay := receiverTargetKeySnapshot(t, r, keys)
 	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
 		t.Fatalf("marked enqueue replay: %v", err)
+	}
+	if afterReplay := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(afterReplay, beforeReplay) {
+		t.Fatal("marked enqueue replay changed receiver transaction state")
 	}
 	dequeued, _, err := r.Dequeue(base.DefaultQueueName)
 	if err != nil || dequeued.ID != msg.ID {
@@ -270,8 +274,12 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 	if count := r.client.HLen(t.Context(), keys[9]).Val(); count != 14 {
 		t.Fatalf("released source field count = %d, want 14", count)
 	}
+	beforeReplay := receiverTargetKeySnapshot(t, r, keys)
 	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
 		t.Fatalf("replay released source: %v", err)
+	}
+	if afterReplay := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(afterReplay, beforeReplay) {
+		t.Fatal("release replay changed receiver transaction state")
 	}
 	if fence := r.client.HGet(t.Context(), keys[9], "releaseFence").Val(); fence != "closed" {
 		t.Fatalf("replayed release fence = %q, want closed", fence)
@@ -787,5 +795,127 @@ func receiverTargetCapacityFixture() map[string]any {
 		"earnedHistory.rows": "0", "earnedHistory.bytes": "0", "earnedHistory.reservedBytes": "0", "earnedHistory.limitRows": "188481", "earnedHistory.limitBytes": "24523320", "earnedHistory.limitReservedBytes": "0",
 		"routinePause.rows": "0", "routinePause.bytes": "0", "routinePause.reservedBytes": "0", "routinePause.limitRows": "62476", "routinePause.limitBytes": "26763034", "routinePause.limitReservedBytes": "0",
 		"queueWakeup.rows": "0", "queueWakeup.bytes": "0", "queueWakeup.reservedBytes": "0", "queueWakeup.limitRows": "61440", "queueWakeup.limitBytes": "353440000", "queueWakeup.limitReservedBytes": "0",
+	}
+}
+
+type receiverTargetRedisKeyState struct {
+	dump string
+	ttl  time.Duration
+}
+
+func receiverTargetKeySnapshot(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) [receiverTargetQueueKeyCount]receiverTargetRedisKeyState {
+	t.Helper()
+	var state [receiverTargetQueueKeyCount]receiverTargetRedisKeyState
+	for i, key := range keys {
+		dump, err := r.client.Dump(t.Context(), key).Result()
+		if err != nil && err != redis.Nil {
+			t.Fatal(err)
+		}
+		state[i] = receiverTargetRedisKeyState{dump: dump, ttl: r.client.PTTL(t.Context(), key).Val()}
+	}
+	return state
+}
+
+func TestReceiverTargetCapacityV2FamilyAndRefusalCoverage(t *testing.T) {
+	engineeringDigest := "70e19aef76a6f73f1a253546df4c1e6d48db271989d56f7667d4ce051ca4e04f"
+	blueprintDigest := "23ba36df6076e55bfedb7047d04d97f2a57b27f6be96cb40f22ead1a1ec2893b"
+	addEngineering := func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+		t.Helper()
+		if err := r.client.HSet(t.Context(), keys[1], "engineeringOutcome", engineeringDigest).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.client.HSet(t.Context(), keys[4], map[string]any{
+			"admitted.rows": "401485", "admitted.bytes": "482601716",
+			"engineeringOutcome.rows": "0", "engineeringOutcome.bytes": "0", "engineeringOutcome.reservedBytes": "0",
+			"engineeringOutcome.limitRows": "768", "engineeringOutcome.limitBytes": "866730", "engineeringOutcome.limitReservedBytes": "0",
+		}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addBlueprint := func(rows, bytes string) func(*testing.T, *RDB, [receiverTargetQueueKeyCount]string) {
+		return func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			t.Helper()
+			if err := r.client.HSet(t.Context(), keys[1], "blueprintStats", blueprintDigest).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.HSet(t.Context(), keys[4], map[string]any{
+				"total.rows": rows, "total.bytes": bytes,
+				"blueprintStats.rows": rows, "blueprintStats.bytes": bytes, "blueprintStats.reservedBytes": "0",
+			}).Err(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tests := []struct {
+		name   string
+		valid  bool
+		mutate func(*testing.T, *RDB, [receiverTargetQueueKeyCount]string)
+	}{
+		{name: "engineering outcome fixed family", valid: true, mutate: addEngineering},
+		{name: "blueprint statistics shared family", valid: true, mutate: addBlueprint("1", "1")},
+		{name: "wrong schema", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "schemaVersion", "receiver-target.capacity.v1")
+		}},
+		{name: "unknown active member", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[1], "unknown", strings.Repeat("a", 64))
+		}},
+		{name: "unknown capacity member", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "unknown", "0")
+		}},
+		{name: "inactive family fields", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "engineeringOutcome.rows", "0", "engineeringOutcome.bytes", "0", "engineeringOutcome.reservedBytes", "0", "engineeringOutcome.limitRows", "768", "engineeringOutcome.limitBytes", "866730", "engineeringOutcome.limitReservedBytes", "0")
+		}},
+		{name: "descriptor mismatch", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[1], "queueWakeup", strings.Repeat("a", 64))
+		}},
+		{name: "admitted totals mismatch", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "admitted.rows", "400718")
+		}},
+		{name: "occupied totals mismatch", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "total.bytes", "1")
+		}},
+		{name: "shared row charge violation", mutate: addBlueprint("2", "1")},
+		{name: "envelope breach", mutate: addBlueprint("1", "121000000")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := setup(t)
+			defer r.Close()
+			now := time.Unix(1725148800, 123)
+			r.SetClock(timeutil.NewSimulatedClock(now))
+			input := receiverTargetInitialFixture(now)
+			msg := receiverTargetQueueEffectMessage()
+			encoded, err := base.EncodeMessage(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys, _, err := r.receiverTargetInitialCommand(t.Context(), msg, encoded, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedReceiverTargetCommon(t, r, keys, input)
+			tc.mutate(t, r, keys)
+			before := receiverTargetKeySnapshot(t, r, keys)
+			err = r.EnqueueReceiverTarget(t.Context(), msg, input)
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if errors.CanonicalCode(err) != errors.FailedPrecondition {
+				t.Fatalf("error = %v, want FailedPrecondition", err)
+			}
+			if after := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(after, before) {
+				t.Fatal("capacity refusal changed receiver transaction state")
+			}
+		})
+	}
+}
+
+func receiverTargetHSet(t *testing.T, r *RDB, key string, values ...interface{}) {
+	t.Helper()
+	if err := r.client.HSet(t.Context(), key, values...).Err(); err != nil {
+		t.Fatal(err)
 	}
 }
