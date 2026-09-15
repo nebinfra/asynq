@@ -1907,23 +1907,31 @@ local function queue_members(key)
 	end
 	return redis.call("LRANGE", key, 0, -1)
 end
-local active = table.getn(queue_members(KEYS[2]))
-if active > 0 then
+local pending = queue_members(KEYS[1])
+local active = queue_members(KEYS[2])
+local scheduled = redis.call("ZRANGE", KEYS[3], 0, -1)
+local retry = redis.call("ZRANGE", KEYS[4], 0, -1)
+local archived = redis.call("ZRANGE", KEYS[5], 0, -1)
+if table.getn(active) > 0 then
     return -2
 end
-for _, id in ipairs(queue_members(KEYS[1])) do
+for _, ids in ipairs({pending, scheduled, retry, archived}) do
+	for _, id in ipairs(ids) do
+		if redis.call("HEXISTS", ARGV[1] .. id, "sourceIdDigest") == 1 then
+			return redis.error_reply("RECEIVER TARGET QUEUE REMOVAL UNSUPPORTED")
+		end
+	end
+end
+for _, id in ipairs(pending) do
 	redis.call("DEL", ARGV[1] .. id)
 end
-for _, id in ipairs(queue_members(KEYS[2])) do
+for _, id in ipairs(scheduled) do
 	redis.call("DEL", ARGV[1] .. id)
 end
-for _, id in ipairs(redis.call("ZRANGE", KEYS[3], 0, -1)) do
+for _, id in ipairs(retry) do
 	redis.call("DEL", ARGV[1] .. id)
 end
-for _, id in ipairs(redis.call("ZRANGE", KEYS[4], 0, -1)) do
-	redis.call("DEL", ARGV[1] .. id)
-end
-for _, id in ipairs(redis.call("ZRANGE", KEYS[5], 0, -1)) do
+for _, id in ipairs(archived) do
 	redis.call("DEL", ARGV[1] .. id)
 end
 redis.call("DEL", KEYS[1])

@@ -435,6 +435,11 @@ func TestInspectorRefusesMarkedTaskWithoutWrites(t *testing.T) {
 		{name: "archive task", run: func(r *RDB) error { return r.ArchiveTask(base.DefaultQueueName, "advance:task") }},
 		{name: "update payload", run: func(r *RDB) error { return r.UpdateTaskPayload(base.DefaultQueueName, "advance:task", []byte(`{}`)) }},
 		{name: "delete task", run: func(r *RDB) error { return r.DeleteTask(base.DefaultQueueName, "advance:task") }},
+		{name: "remove queue force", run: func(r *RDB) error { return r.RemoveQueue(base.DefaultQueueName, true) }},
+		{name: "write result", run: func(r *RDB) error {
+			_, err := r.WriteResult(base.DefaultQueueName, "advance:task", []byte("result"))
+			return err
+		}},
 		{name: "run all", run: func(r *RDB) error { _, err := r.RunAllScheduledTasks(base.DefaultQueueName); return err }},
 		{name: "archive all", run: func(r *RDB) error { _, err := r.ArchiveAllScheduledTasks(base.DefaultQueueName); return err }},
 		{name: "delete all", run: func(r *RDB) error { _, err := r.DeleteAllScheduledTasks(base.DefaultQueueName); return err }},
@@ -472,6 +477,208 @@ func TestInspectorRefusesMarkedTaskWithoutWrites(t *testing.T) {
 			}
 			if score, err := r.client.ZScore(ctx, base.ScheduledKey(msg.Queue), msg.ID).Result(); err != nil || score != 123 {
 				t.Fatalf("scheduled membership after refusal = %v, %v", score, err)
+			}
+		})
+	}
+}
+
+func TestRemoveQueueForceRefusesMarkedTaskWithoutWrites(t *testing.T) {
+	for _, state := range []string{"pending", "scheduled", "retry", "archived"} {
+		t.Run(state, func(t *testing.T) {
+			r := setup(t)
+			defer r.Close()
+			ctx := t.Context()
+			const markedID = "advance:marked"
+			const ordinaryID = "ordinary"
+			markedKey := base.TaskKey(base.DefaultQueueName, markedID)
+			ordinaryKey := base.TaskKey(base.DefaultQueueName, ordinaryID)
+			if err := r.client.HSet(ctx, markedKey, "state", state, "sourceIdDigest", strings.Repeat("a", 64)).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.HSet(ctx, ordinaryKey, "state", state).Err(); err != nil {
+				t.Fatal(err)
+			}
+			stateKey := map[string]string{
+				"pending": base.PendingKey(base.DefaultQueueName), "scheduled": base.ScheduledKey(base.DefaultQueueName),
+				"retry": base.RetryKey(base.DefaultQueueName), "archived": base.ArchivedKey(base.DefaultQueueName),
+			}[state]
+			if err := r.client.ZAdd(ctx, stateKey,
+				redis.Z{Score: 1, Member: markedID}, redis.Z{Score: 2, Member: ordinaryID}).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.SAdd(ctx, base.AllQueues, base.DefaultQueueName).Err(); err != nil {
+				t.Fatal(err)
+			}
+			keys := []string{
+				markedKey, ordinaryKey, base.PendingKey(base.DefaultQueueName), base.ActiveKey(base.DefaultQueueName),
+				base.ScheduledKey(base.DefaultQueueName), base.RetryKey(base.DefaultQueueName),
+				base.ArchivedKey(base.DefaultQueueName), base.LeaseKey(base.DefaultQueueName), base.AllQueues,
+			}
+			before := make(map[string]string, len(keys))
+			for _, key := range keys {
+				before[key] = r.client.Dump(ctx, key).Val()
+			}
+			if err := r.RemoveQueue(base.DefaultQueueName, true); err == nil || !strings.Contains(err.Error(), "RECEIVER TARGET QUEUE REMOVAL UNSUPPORTED") {
+				t.Fatalf("force removal error = %v, want receiver target refusal", err)
+			}
+			for _, key := range keys {
+				if after := r.client.Dump(ctx, key).Val(); after != before[key] {
+					t.Errorf("key %q changed after refusal", key)
+				}
+			}
+		})
+	}
+}
+
+func TestWriteResultRefusalPreservesRedisErrorClassification(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	ctx := t.Context()
+	taskKey := base.TaskKey(base.DefaultQueueName, "advance:task")
+	if err := r.client.HSet(ctx, taskKey, "sourceIdDigest", strings.Repeat("a", 64)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	_, err := r.WriteResult(base.DefaultQueueName, "advance:task", []byte("result"))
+	if !errors.IsRedisCommandError(err) {
+		t.Fatalf("WriteResult error = %v, want RedisCommandError classification", err)
+	}
+}
+
+func TestDeleteExpiredCompletedTasksRefusesMarkedTaskWithoutWrites(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	ctx := t.Context()
+	now := time.Unix(1700000000, 0)
+	r.SetClock(timeutil.NewSimulatedClock(now))
+	const markedID = "advance:marked"
+	const ordinaryID = "ordinary"
+	markedKey := base.TaskKey(base.DefaultQueueName, markedID)
+	ordinaryKey := base.TaskKey(base.DefaultQueueName, ordinaryID)
+	if err := r.client.HSet(ctx, markedKey, "state", "completed", "sourceIdDigest", strings.Repeat("a", 64)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.HSet(ctx, ordinaryKey, "state", "completed").Err(); err != nil {
+		t.Fatal(err)
+	}
+	completedKey := base.CompletedKey(base.DefaultQueueName)
+	if err := r.client.ZAdd(ctx, completedKey,
+		redis.Z{Score: float64(now.Unix() - 2), Member: markedID},
+		redis.Z{Score: float64(now.Unix() - 1), Member: ordinaryID}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{markedKey, ordinaryKey, completedKey}
+	before := make(map[string]string, len(keys))
+	for _, key := range keys {
+		before[key] = r.client.Dump(ctx, key).Val()
+	}
+	if err := r.DeleteExpiredCompletedTasks(base.DefaultQueueName, 100); err == nil || !strings.Contains(err.Error(), "RECEIVER TARGET COMPLETED CLEANUP UNSUPPORTED") {
+		t.Fatalf("completed cleanup error = %v, want receiver target refusal", err)
+	}
+	for _, key := range keys {
+		if after := r.client.Dump(ctx, key).Val(); after != before[key] {
+			t.Errorf("key %q changed after refusal", key)
+		}
+	}
+}
+
+func TestMarkAsCompleteRefusesMarkedTaskWithoutWrites(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	ctx := t.Context()
+	now := time.Unix(1700000000, 0)
+	r.SetClock(timeutil.NewSimulatedClock(now))
+	msg := receiverTargetQueueEffectMessage()
+	msg.Retention = 3600
+	encoded, err := base.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskKey := base.TaskKey(msg.Queue, msg.ID)
+	if err := r.client.HSet(ctx, taskKey, "msg", encoded, "state", "active", "sourceIdDigest", strings.Repeat("a", 64)).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.ZAdd(ctx, base.ActiveKey(msg.Queue), redis.Z{Score: 1, Member: msg.ID}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.client.ZAdd(ctx, base.LeaseKey(msg.Queue), redis.Z{Score: float64(now.Unix() + 30), Member: msg.ID}).Err(); err != nil {
+		t.Fatal(err)
+	}
+	keys := []string{
+		taskKey, base.ActiveKey(msg.Queue), base.LeaseKey(msg.Queue), base.CompletedKey(msg.Queue),
+		base.ProcessedKey(msg.Queue, now), base.ProcessedTotalKey(msg.Queue),
+	}
+	before := make(map[string]string, len(keys))
+	for _, key := range keys {
+		before[key] = r.client.Dump(ctx, key).Val()
+	}
+	if err := r.MarkAsComplete(ctx, msg); err == nil || !strings.Contains(err.Error(), "receiver target completion retention unsupported") {
+		t.Fatalf("completion error = %v, want receiver target refusal", err)
+	}
+	for _, key := range keys {
+		if after := r.client.Dump(ctx, key).Val(); after != before[key] {
+			t.Errorf("key %q changed after refusal", key)
+		}
+	}
+}
+
+func TestInspectorBulkRefusesMarkedTaskWithoutWrites(t *testing.T) {
+	const group = "group"
+	tests := []struct {
+		name  string
+		state string
+		run   func(*RDB) error
+	}{
+		{"archive pending", "pending", func(r *RDB) error { _, err := r.ArchiveAllPendingTasks(base.DefaultQueueName); return err }},
+		{"delete pending", "pending", func(r *RDB) error { _, err := r.DeleteAllPendingTasks(base.DefaultQueueName); return err }},
+		{"run aggregating", "aggregating", func(r *RDB) error { _, err := r.RunAllAggregatingTasks(base.DefaultQueueName, group); return err }},
+		{"archive aggregating", "aggregating", func(r *RDB) error { _, err := r.ArchiveAllAggregatingTasks(base.DefaultQueueName, group); return err }},
+		{"delete aggregating", "aggregating", func(r *RDB) error { _, err := r.DeleteAllAggregatingTasks(base.DefaultQueueName, group); return err }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r := setup(t)
+			defer r.Close()
+			ctx := t.Context()
+			msg := receiverTargetQueueEffectMessage()
+			encoded, err := base.EncodeMessage(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			taskKey := base.TaskKey(msg.Queue, msg.ID)
+			fields := []any{"msg", encoded, "state", test.state, "sourceIdDigest", strings.Repeat("a", 64)}
+			if test.state == "aggregating" {
+				fields = append(fields, "group", group)
+			}
+			if err := r.client.HSet(ctx, taskKey, fields...).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if test.state == "pending" {
+				if err := r.client.ZAdd(ctx, base.PendingKey(msg.Queue), redis.Z{Score: 1, Member: msg.ID}).Err(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := r.client.ZAdd(ctx, base.GroupKey(msg.Queue, group), redis.Z{Score: 1, Member: msg.ID}).Err(); err != nil {
+					t.Fatal(err)
+				}
+				if err := r.client.SAdd(ctx, base.AllGroups(msg.Queue), group).Err(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := r.client.SAdd(ctx, base.AllQueues, msg.Queue).Err(); err != nil {
+				t.Fatal(err)
+			}
+			keys := []string{taskKey, base.PendingKey(msg.Queue), base.ActiveKey(msg.Queue), base.ScheduledKey(msg.Queue), base.RetryKey(msg.Queue), base.ArchivedKey(msg.Queue), base.CompletedKey(msg.Queue), base.LeaseKey(msg.Queue), base.GroupKey(msg.Queue, group), base.AllGroups(msg.Queue), base.AllQueues}
+			before := make(map[string]string, len(keys))
+			for _, key := range keys {
+				before[key] = r.client.Dump(ctx, key).Val()
+			}
+			if err := test.run(r); err == nil || !strings.Contains(err.Error(), "RECEIVER TARGET") {
+				t.Fatalf("bulk Inspector error = %v, want receiver target refusal", err)
+			}
+			for _, key := range keys {
+				if after := r.client.Dump(ctx, key).Val(); after != before[key] {
+					t.Errorf("key %q changed after refusal", key)
+				}
 			}
 		})
 	}

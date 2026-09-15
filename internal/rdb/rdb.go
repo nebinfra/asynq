@@ -1431,6 +1431,11 @@ func (r *RDB) ReclaimStaleAggregationSets(qname string) error {
 var deleteExpiredCompletedTasksCmd = redis.NewScript(`
 local ids = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", ARGV[1], "LIMIT", 0, tonumber(ARGV[3]))
 for _, id in ipairs(ids) do
+	if redis.call("HEXISTS", ARGV[2] .. id, "sourceIdDigest") == 1 then
+		return redis.error_reply("RECEIVER TARGET COMPLETED CLEANUP UNSUPPORTED")
+	end
+end
+for _, id in ipairs(ids) do
 	redis.call("DEL", ARGV[2] .. id)
 	redis.call("ZREM", KEYS[1], id)
 end
@@ -1736,13 +1741,23 @@ func (r *RDB) ClearSchedulerHistory(entryID string) error {
 	return nil
 }
 
+// KEYS[1] -> asynq:{<qname>}:t:<task_id>
+// ARGV[1] -> result data
+var writeResultCmd = redis.NewScript(`
+if redis.call("HEXISTS", KEYS[1], "sourceIdDigest") == 1 then
+	return redis.error_reply("RECEIVER TARGET RESULT MUTATION UNSUPPORTED")
+end
+redis.call("HSET", KEYS[1], "result", ARGV[1])
+return redis.status_reply("OK")
+`)
+
 // WriteResult writes the given result data for the specified task.
 func (r *RDB) WriteResult(qname, taskID string, data []byte) (int, error) {
 	var op errors.Op = "rdb.WriteResult"
 	ctx := context.Background()
 	taskKey := base.TaskKey(qname, taskID)
-	if err := r.client.HSet(ctx, taskKey, "result", data).Err(); err != nil {
-		return 0, errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "hset", Err: err})
+	if err := writeResultCmd.Run(ctx, r.client, []string{taskKey}, data).Err(); err != nil {
+		return 0, errors.E(op, errors.Unknown, &errors.RedisCommandError{Command: "eval", Err: err})
 	}
 	return len(data), nil
 }
