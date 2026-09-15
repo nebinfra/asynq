@@ -3,6 +3,7 @@ package rdb
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -146,8 +147,12 @@ func TestEnqueueReceiverTargetUsesGeneratedTransaction(t *testing.T) {
 	if digest := r.client.HGet(t.Context(), keys[9], "ackReceiptDigest").Val(); digest == "" {
 		t.Fatal("finalized source has no acknowledgement receipt")
 	}
+	beforeReplay := receiverTargetKeySnapshot(t, r, keys)
 	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
 		t.Fatalf("marked enqueue replay: %v", err)
+	}
+	if afterReplay := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(afterReplay, beforeReplay) {
+		t.Fatal("marked enqueue replay changed receiver transaction state")
 	}
 	dequeued, _, err := r.Dequeue(base.DefaultQueueName)
 	if err != nil || dequeued.ID != msg.ID {
@@ -270,8 +275,12 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 	if count := r.client.HLen(t.Context(), keys[9]).Val(); count != 14 {
 		t.Fatalf("released source field count = %d, want 14", count)
 	}
+	beforeReplay := receiverTargetKeySnapshot(t, r, keys)
 	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
 		t.Fatalf("replay released source: %v", err)
+	}
+	if afterReplay := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(afterReplay, beforeReplay) {
+		t.Fatal("release replay changed receiver transaction state")
 	}
 	if fence := r.client.HGet(t.Context(), keys[9], "releaseFence").Val(); fence != "closed" {
 		t.Fatalf("replayed release fence = %q, want closed", fence)
@@ -780,11 +789,175 @@ func seedReceiverTargetCommon(t *testing.T, r *RDB, keys [receiverTargetQueueKey
 
 func receiverTargetCapacityFixture() map[string]any {
 	return map[string]any{
-		"total.rows": "0", "total.bytes": "0", "total.reservedBytes": "0", "admitted.rows": "400717", "admitted.bytes": "481734986", "admitted.reservedBytes": "0",
-		"envelope.declaredCeilingBytes": "601882624", "envelope.predecessorMeasurementProofDigest": "sha256:3d0e3b7f42bd36a9b4254aa6979a5b2d4c9fb60629a588546264c0a3fe3eb9d6", "kernel.reservedBytes": "1085", "kernel.proofDigest": "sha256:eb7ac47fa2dc0fe0e78a4607d135fa799b1cdb702c4b7b7c77b853aee84047e2",
+		"schemaVersion": "receiver-target.capacity.v2",
+		"total.rows":    "0", "total.bytes": "0", "total.reservedBytes": "0", "admitted.rows": "400717", "admitted.bytes": "481734986", "admitted.reservedBytes": "0",
+		"envelope.declaredCeilingBytes": "601882624", "envelope.predecessorMeasurementProofDigest": "sha256:3d0e3b7f42bd36a9b4254aa6979a5b2d4c9fb60629a588546264c0a3fe3eb9d6", "kernel.reservedBytes": "2639", "kernel.proofDigest": "sha256:d1518bea5f6314653a7ccbe314b0c51f0a5b07d451a8782eaa78f07ce28c44d3",
 		"agentStats.rows": "0", "agentStats.bytes": "0", "agentStats.reservedBytes": "0", "agentStats.limitRows": "88320", "agentStats.limitBytes": "77008632", "agentStats.limitReservedBytes": "0",
 		"earnedHistory.rows": "0", "earnedHistory.bytes": "0", "earnedHistory.reservedBytes": "0", "earnedHistory.limitRows": "188481", "earnedHistory.limitBytes": "24523320", "earnedHistory.limitReservedBytes": "0",
 		"routinePause.rows": "0", "routinePause.bytes": "0", "routinePause.reservedBytes": "0", "routinePause.limitRows": "62476", "routinePause.limitBytes": "26763034", "routinePause.limitReservedBytes": "0",
 		"queueWakeup.rows": "0", "queueWakeup.bytes": "0", "queueWakeup.reservedBytes": "0", "queueWakeup.limitRows": "61440", "queueWakeup.limitBytes": "353440000", "queueWakeup.limitReservedBytes": "0",
+	}
+}
+
+type receiverTargetRedisKeyState struct {
+	kind    string
+	value   interface{}
+	ttlKind int8
+}
+
+func receiverTargetKeySnapshot(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) [receiverTargetQueueKeyCount]receiverTargetRedisKeyState {
+	t.Helper()
+	var state [receiverTargetQueueKeyCount]receiverTargetRedisKeyState
+	for i, key := range keys {
+		kind, err := r.client.Type(t.Context(), key).Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var value interface{}
+		switch kind {
+		case "none":
+		case "hash":
+			value = r.client.HGetAll(t.Context(), key).Val()
+		case "string":
+			value = r.client.Get(t.Context(), key).Val()
+		case "set":
+			members := r.client.SMembers(t.Context(), key).Val()
+			sort.Strings(members)
+			value = members
+		case "zset":
+			value = r.client.ZRangeWithScores(t.Context(), key, 0, -1).Val()
+		default:
+			t.Fatalf("unsupported Redis key type %q", kind)
+		}
+		ttl := r.client.PTTL(t.Context(), key).Val()
+		ttlKind := int8(1)
+		if ttl == -1 {
+			ttlKind = -1
+		} else if ttl == -2 {
+			ttlKind = -2
+		}
+		state[i] = receiverTargetRedisKeyState{kind: kind, value: value, ttlKind: ttlKind}
+	}
+	return state
+}
+
+func TestReceiverTargetCapacityV2FamilyAndRefusalCoverage(t *testing.T) {
+	engineeringDigest := "70e19aef76a6f73f1a253546df4c1e6d48db271989d56f7667d4ce051ca4e04f"
+	blueprintDigest := "23ba36df6076e55bfedb7047d04d97f2a57b27f6be96cb40f22ead1a1ec2893b"
+	addEngineering := func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+		t.Helper()
+		if err := r.client.HSet(t.Context(), keys[1], "engineeringOutcome", engineeringDigest).Err(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.client.HSet(t.Context(), keys[4], map[string]any{
+			"admitted.rows": "401485", "admitted.bytes": "482601716",
+			"engineeringOutcome.rows": "0", "engineeringOutcome.bytes": "0", "engineeringOutcome.reservedBytes": "0",
+			"engineeringOutcome.limitRows": "768", "engineeringOutcome.limitBytes": "866730", "engineeringOutcome.limitReservedBytes": "0",
+		}).Err(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addBlueprint := func(rows, bytes string) func(*testing.T, *RDB, [receiverTargetQueueKeyCount]string) {
+		return func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			t.Helper()
+			if err := r.client.HSet(t.Context(), keys[1], "blueprintStats", blueprintDigest).Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.HSet(t.Context(), keys[4], map[string]any{
+				"total.rows": rows, "total.bytes": bytes,
+				"blueprintStats.rows": rows, "blueprintStats.bytes": bytes, "blueprintStats.reservedBytes": "0",
+			}).Err(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tests := []struct {
+		name   string
+		valid  bool
+		mutate func(*testing.T, *RDB, [receiverTargetQueueKeyCount]string)
+	}{
+		{name: "engineering outcome fixed family", valid: true, mutate: addEngineering},
+		{name: "blueprint statistics shared family", valid: true, mutate: addBlueprint("1", "1")},
+		{name: "all six families", valid: true, mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			addEngineering(t, r, keys)
+			addBlueprint("1", "1")(t, r, keys)
+		}},
+		{name: "wrong schema", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "schemaVersion", "receiver-target.capacity.v1")
+		}},
+		{name: "unknown active member", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[1], "unknown", strings.Repeat("a", 64))
+		}},
+		{name: "unknown capacity member", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "unknown", "0")
+		}},
+		{name: "inactive family fields", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "engineeringOutcome.rows", "0", "engineeringOutcome.bytes", "0", "engineeringOutcome.reservedBytes", "0", "engineeringOutcome.limitRows", "768", "engineeringOutcome.limitBytes", "866730", "engineeringOutcome.limitReservedBytes", "0")
+		}},
+		{name: "descriptor mismatch", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[1], "queueWakeup", strings.Repeat("a", 64))
+		}},
+		{name: "admitted totals mismatch", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "admitted.rows", "400718")
+		}},
+		{name: "occupied totals mismatch", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			receiverTargetHSet(t, r, keys[4], "total.bytes", "1")
+		}},
+		{name: "shared row charge violation", mutate: addBlueprint("2", "1")},
+		{name: "envelope breach", mutate: addBlueprint("1", "121000000")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := setup(t)
+			defer r.Close()
+			now := time.Unix(1725148800, 123)
+			r.SetClock(timeutil.NewSimulatedClock(now))
+			input := receiverTargetInitialFixture(now)
+			msg := receiverTargetQueueEffectMessage()
+			encoded, err := base.EncodeMessage(msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys, _, err := r.receiverTargetInitialCommand(t.Context(), msg, encoded, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedReceiverTargetCommon(t, r, keys, input)
+			tc.mutate(t, r, keys)
+			before := receiverTargetKeySnapshot(t, r, keys)
+			err = r.EnqueueReceiverTarget(t.Context(), msg, input)
+			if tc.valid {
+				if err != nil {
+					t.Fatal(err)
+				}
+				capacity := r.client.HGetAll(t.Context(), keys[4]).Val()
+				queueRows, rowsErr := strconv.ParseInt(capacity["queueWakeup.rows"], 10, 64)
+				queueBytes, bytesErr := strconv.ParseInt(capacity["queueWakeup.bytes"], 10, 64)
+				totalRows, totalRowsErr := strconv.ParseInt(capacity["total.rows"], 10, 64)
+				totalBytes, totalBytesErr := strconv.ParseInt(capacity["total.bytes"], 10, 64)
+				blueprintRows, _ := strconv.ParseInt(capacity["blueprintStats.rows"], 10, 64)
+				blueprintBytes, _ := strconv.ParseInt(capacity["blueprintStats.bytes"], 10, 64)
+				if rowsErr != nil || bytesErr != nil || totalRowsErr != nil || totalBytesErr != nil || queueRows <= 0 || queueBytes <= 0 || totalRows != queueRows+blueprintRows || totalBytes != queueBytes+blueprintBytes {
+					t.Fatalf("invalid projected capacity: %#v", capacity)
+				}
+				return
+			}
+			if errors.CanonicalCode(err) != errors.FailedPrecondition {
+				t.Fatalf("error = %v, want FailedPrecondition", err)
+			}
+			after := receiverTargetKeySnapshot(t, r, keys)
+			for i := range before {
+				if !reflect.DeepEqual(after[i], before[i]) {
+					t.Fatalf("capacity refusal changed receiver transaction key %d", i+1)
+				}
+			}
+		})
+	}
+}
+
+func receiverTargetHSet(t *testing.T, r *RDB, key string, values ...interface{}) {
+	t.Helper()
+	if err := r.client.HSet(t.Context(), key, values...).Err(); err != nil {
+		t.Fatal(err)
 	}
 }
