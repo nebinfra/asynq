@@ -3,6 +3,7 @@ package rdb
 import (
 	"context"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -799,19 +800,43 @@ func receiverTargetCapacityFixture() map[string]any {
 }
 
 type receiverTargetRedisKeyState struct {
-	dump string
-	ttl  time.Duration
+	kind    string
+	value   interface{}
+	ttlKind int8
 }
 
 func receiverTargetKeySnapshot(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) [receiverTargetQueueKeyCount]receiverTargetRedisKeyState {
 	t.Helper()
 	var state [receiverTargetQueueKeyCount]receiverTargetRedisKeyState
 	for i, key := range keys {
-		dump, err := r.client.Dump(t.Context(), key).Result()
-		if err != nil && err != redis.Nil {
+		kind, err := r.client.Type(t.Context(), key).Result()
+		if err != nil {
 			t.Fatal(err)
 		}
-		state[i] = receiverTargetRedisKeyState{dump: dump, ttl: r.client.PTTL(t.Context(), key).Val()}
+		var value interface{}
+		switch kind {
+		case "none":
+		case "hash":
+			value = r.client.HGetAll(t.Context(), key).Val()
+		case "string":
+			value = r.client.Get(t.Context(), key).Val()
+		case "set":
+			members := r.client.SMembers(t.Context(), key).Val()
+			sort.Strings(members)
+			value = members
+		case "zset":
+			value = r.client.ZRangeWithScores(t.Context(), key, 0, -1).Val()
+		default:
+			t.Fatalf("unsupported Redis key type %q", kind)
+		}
+		ttl := r.client.PTTL(t.Context(), key).Val()
+		ttlKind := int8(1)
+		if ttl == -1 {
+			ttlKind = -1
+		} else if ttl == -2 {
+			ttlKind = -2
+		}
+		state[i] = receiverTargetRedisKeyState{kind: kind, value: value, ttlKind: ttlKind}
 	}
 	return state
 }
@@ -853,6 +878,10 @@ func TestReceiverTargetCapacityV2FamilyAndRefusalCoverage(t *testing.T) {
 	}{
 		{name: "engineering outcome fixed family", valid: true, mutate: addEngineering},
 		{name: "blueprint statistics shared family", valid: true, mutate: addBlueprint("1", "1")},
+		{name: "all six families", valid: true, mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			addEngineering(t, r, keys)
+			addBlueprint("1", "1")(t, r, keys)
+		}},
 		{name: "wrong schema", mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
 			receiverTargetHSet(t, r, keys[4], "schemaVersion", "receiver-target.capacity.v1")
 		}},
@@ -901,13 +930,26 @@ func TestReceiverTargetCapacityV2FamilyAndRefusalCoverage(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				capacity := r.client.HGetAll(t.Context(), keys[4]).Val()
+				queueRows, rowsErr := strconv.ParseInt(capacity["queueWakeup.rows"], 10, 64)
+				queueBytes, bytesErr := strconv.ParseInt(capacity["queueWakeup.bytes"], 10, 64)
+				totalRows, totalRowsErr := strconv.ParseInt(capacity["total.rows"], 10, 64)
+				totalBytes, totalBytesErr := strconv.ParseInt(capacity["total.bytes"], 10, 64)
+				blueprintRows, _ := strconv.ParseInt(capacity["blueprintStats.rows"], 10, 64)
+				blueprintBytes, _ := strconv.ParseInt(capacity["blueprintStats.bytes"], 10, 64)
+				if rowsErr != nil || bytesErr != nil || totalRowsErr != nil || totalBytesErr != nil || queueRows <= 0 || queueBytes <= 0 || totalRows != queueRows+blueprintRows || totalBytes != queueBytes+blueprintBytes {
+					t.Fatalf("invalid projected capacity: %#v", capacity)
+				}
 				return
 			}
 			if errors.CanonicalCode(err) != errors.FailedPrecondition {
 				t.Fatalf("error = %v, want FailedPrecondition", err)
 			}
-			if after := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(after, before) {
-				t.Fatal("capacity refusal changed receiver transaction state")
+			after := receiverTargetKeySnapshot(t, r, keys)
+			for i := range before {
+				if !reflect.DeepEqual(after[i], before[i]) {
+					t.Fatalf("capacity refusal changed receiver transaction key %d", i+1)
+				}
 			}
 		})
 	}
