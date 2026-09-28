@@ -791,7 +791,7 @@ func receiverTargetCapacityFixture() map[string]any {
 	return map[string]any{
 		"schemaVersion": "receiver-target.capacity.v2",
 		"total.rows":    "0", "total.bytes": "0", "total.reservedBytes": "0", "admitted.rows": "400717", "admitted.bytes": "481734986", "admitted.reservedBytes": "0",
-		"envelope.declaredCeilingBytes": "601882624", "envelope.predecessorMeasurementProofDigest": "sha256:3d0e3b7f42bd36a9b4254aa6979a5b2d4c9fb60629a588546264c0a3fe3eb9d6", "kernel.reservedBytes": "2639", "kernel.proofDigest": "sha256:d1518bea5f6314653a7ccbe314b0c51f0a5b07d451a8782eaa78f07ce28c44d3",
+		"envelope.declaredCeilingBytes": "601882624", "envelope.predecessorMeasurementProofDigest": "sha256:3d0e3b7f42bd36a9b4254aa6979a5b2d4c9fb60629a588546264c0a3fe3eb9d6", "kernel.reservedBytes": "2639", "kernel.proofDigest": "sha256:eab321002516daf6e17f003c3f21d4d24d41b3db01e43c9691ac3e1dc6f46d72",
 		"agentStats.rows": "0", "agentStats.bytes": "0", "agentStats.reservedBytes": "0", "agentStats.limitRows": "88320", "agentStats.limitBytes": "77008632", "agentStats.limitReservedBytes": "0",
 		"earnedHistory.rows": "0", "earnedHistory.bytes": "0", "earnedHistory.reservedBytes": "0", "earnedHistory.limitRows": "188481", "earnedHistory.limitBytes": "24523320", "earnedHistory.limitReservedBytes": "0",
 		"routinePause.rows": "0", "routinePause.bytes": "0", "routinePause.reservedBytes": "0", "routinePause.limitRows": "62476", "routinePause.limitBytes": "26763034", "routinePause.limitReservedBytes": "0",
