@@ -226,6 +226,7 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 		t.Fatal(err)
 	}
 	seedReceiverTargetCommon(t, r, keys, input)
+	rowsBefore := r.client.HGet(t.Context(), keys[4], "queueWakeup.rows").Val()
 	if err := r.EnqueueReceiverTarget(t.Context(), msg, input); err != nil {
 		t.Fatal(err)
 	}
@@ -269,11 +270,13 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
 		t.Fatalf("release absent marked task: %v", err)
 	}
-	if fence := r.client.HGet(t.Context(), keys[9], "releaseFence").Val(); fence != "closed" {
-		t.Fatalf("release fence = %q, want closed", fence)
+	// Release is the source's last operation: its finalize deletes the source
+	// and returns every row the enqueue charged.
+	if exists := r.client.Exists(t.Context(), keys[9]).Val(); exists != 0 {
+		t.Fatalf("released source survived finalize: %d", exists)
 	}
-	if count := r.client.HLen(t.Context(), keys[9]).Val(); count != 14 {
-		t.Fatalf("released source field count = %d, want 14", count)
+	if rows := r.client.HGet(t.Context(), keys[4], "queueWakeup.rows").Val(); rows != rowsBefore {
+		t.Fatalf("queueWakeup rows after release = %s, want %s", rows, rowsBefore)
 	}
 	beforeReplay := receiverTargetKeySnapshot(t, r, keys)
 	if err := r.ReleaseReceiverTarget(t.Context(), msg.ID, release); err != nil {
@@ -282,8 +285,8 @@ func TestReleaseReceiverTargetRequiresCommittedInboxAndAbsence(t *testing.T) {
 	if afterReplay := receiverTargetKeySnapshot(t, r, keys); !reflect.DeepEqual(afterReplay, beforeReplay) {
 		t.Fatal("release replay changed receiver transaction state")
 	}
-	if fence := r.client.HGet(t.Context(), keys[9], "releaseFence").Val(); fence != "closed" {
-		t.Fatalf("replayed release fence = %q, want closed", fence)
+	if exists := r.client.Exists(t.Context(), keys[9]).Val(); exists != 0 {
+		t.Fatalf("replayed release recreated the source: %d", exists)
 	}
 	if exists := r.client.Exists(t.Context(), keys[10]).Val(); exists != 0 {
 		t.Fatalf("released task exists: %d", exists)

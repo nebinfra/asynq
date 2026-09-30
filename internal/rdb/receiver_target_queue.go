@@ -116,11 +116,37 @@ func (r *RDB) executeReceiverTargetTaskCAS(ctx context.Context, op errors.Op, ke
 
 func (r *RDB) ReleaseReceiverTarget(ctx context.Context, taskID string, input base.ReceiverTargetQueueRelease) error {
 	const op errors.Op = "rdb.ReleaseReceiverTarget"
+	if retired, err := r.receiverTargetSourceRetired(ctx, taskID, input); err != nil {
+		return errors.E(op, errors.FailedPrecondition, err)
+	} else if retired {
+		return nil
+	}
 	keys, operands, err := r.receiverTargetReleaseCommand(ctx, taskID, input)
 	if err != nil {
 		return errors.E(op, errors.FailedPrecondition, err)
 	}
 	return r.executeReceiverTargetTaskCAS(ctx, op, keys, operands)
+}
+
+// receiverTargetSourceRetired reports a Release replay after its finalize
+// deleted the source. A source is written before its effect's inbox commits,
+// so an absent source and task beside a committed queue_wakeup inbox can only
+// be that retired state.
+func (r *RDB) receiverTargetSourceRetired(ctx context.Context, taskID string, input base.ReceiverTargetQueueRelease) (bool, error) {
+	sourceKey := "nebpilot:e:" + input.StateEpoch + ":receiver-target:queue-reservation:" + input.SourceIDDigest + ":" + taskID
+	inboxKey := "nebpilot:e:" + input.StateEpoch + ":effects:receiver-inbox:body:" + input.EffectID
+	counts, err := r.client.Exists(ctx, sourceKey).Result()
+	if err != nil || counts != 0 {
+		return false, err
+	}
+	if exists, err := r.client.Exists(ctx, base.TaskKey(base.DefaultQueueName, taskID)).Result(); err != nil || exists != 0 {
+		return false, err
+	}
+	inbox, err := r.client.HMGet(ctx, inboxKey, "state", "kind", "receiptRevision").Result()
+	if err != nil {
+		return false, err
+	}
+	return len(inbox) == 3 && inbox[0] == "committed" && inbox[1] == "queue_wakeup" && inbox[2] == "1", nil
 }
 
 func (r *RDB) receiverTargetReleaseCommand(ctx context.Context, taskID string, input base.ReceiverTargetQueueRelease) ([receiverTargetQueueKeyCount]string, [receiverTargetQueueOperandCount]string, error) {

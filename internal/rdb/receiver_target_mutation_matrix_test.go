@@ -335,7 +335,7 @@ func receiverTargetDirectMutations(files map[string]*ast.File) map[string]int {
 		"Close": true, "Ping": true, "Exists": true, "HLen": true, "ZRevRangeWithScores": true,
 		"ZCount": true, "HExists": true, "ZScore": true, "ZRangeWithScores": true, "SMembers": true,
 		"Info": true, "ClusterInfo": true, "SIsMember": true, "Get": true, "HVals": true, "LRange": true,
-		"ClusterKeySlot": true, "ClusterSlots": true, "Subscribe": true,
+		"ClusterKeySlot": true, "ClusterSlots": true, "Subscribe": true, "HMGet": true,
 	}
 	result := make(map[string]int)
 	for _, file := range files {
