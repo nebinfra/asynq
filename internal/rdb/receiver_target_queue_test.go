@@ -367,3 +367,23 @@ func assertQueueScores(t *testing.T, r *RDB, key string, want []redis.Z) {
 		}
 	}
 }
+
+func TestReceiverTargetInitialPlacementReadsTailOnce(t *testing.T) {
+	r := setup(t)
+	defer r.Close()
+	ctx := context.Background()
+	pending := base.PendingKey(base.DefaultQueueName)
+	r.client.ZAdd(ctx, pending, redis.Z{Score: 4, Member: "a"}, redis.Z{Score: 7, Member: "b"})
+	state, _, score, err := r.receiverTargetInitialPlacement(ctx, r.clock.Now())
+	if err != nil || state != "pending" || score != "8" {
+		t.Fatalf("unique tail placement = %q %q %v, want pending 8", state, score, err)
+	}
+	r.client.ZAdd(ctx, pending, redis.Z{Score: 7, Member: "c"})
+	if _, _, _, err := r.receiverTargetInitialPlacement(ctx, r.clock.Now()); err == nil {
+		t.Fatal("a shared tail score was accepted")
+	}
+	r.client.Del(ctx, pending)
+	if _, _, score, err := r.receiverTargetInitialPlacement(ctx, r.clock.Now()); err != nil || score != "0" {
+		t.Fatalf("empty queue placement = %q %v, want 0", score, err)
+	}
+}
