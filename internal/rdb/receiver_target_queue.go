@@ -274,18 +274,18 @@ func (r *RDB) receiverTargetInitialPlacement(ctx context.Context, processAt time
 		score = strconv.FormatInt(processAt.Unix(), 10)
 		return "scheduled", score, score, nil
 	}
-	tail, err := r.client.ZRevRangeWithScores(ctx, base.PendingKey(base.DefaultQueueName), 0, 0).Result()
+	// One read: the tail and its neighbour arrive together, so a concurrent
+	// dequeue cannot remove the tail between reading its score and counting it.
+	tail, err := r.client.ZRevRangeWithScores(ctx, base.PendingKey(base.DefaultQueueName), 0, 1).Result()
 	if err != nil {
 		return "", "", "", err
 	}
 	value := int64(0)
 	if len(tail) != 0 {
-		if len(tail) != 1 || tail[0].Score != math.Trunc(tail[0].Score) || tail[0].Score < -receiverTargetMaximumQueueScore || tail[0].Score >= receiverTargetMaximumQueueScore {
+		if tail[0].Score != math.Trunc(tail[0].Score) || tail[0].Score < -receiverTargetMaximumQueueScore || tail[0].Score >= receiverTargetMaximumQueueScore {
 			return "", "", "", fmt.Errorf("queue score exhausted")
 		}
-		raw := strconv.FormatInt(int64(tail[0].Score), 10)
-		count, countErr := r.client.ZCount(ctx, base.PendingKey(base.DefaultQueueName), raw, raw).Result()
-		if countErr != nil || count != 1 {
+		if len(tail) == 2 && tail[1].Score == tail[0].Score {
 			return "", "", "", fmt.Errorf("queue score is not unique")
 		}
 		value = int64(tail[0].Score) + 1
@@ -636,10 +636,12 @@ func (r *RDB) receiverTargetNativeDelta(ctx context.Context, taskID string, task
 func (r *RDB) receiverTargetEndpointScore(ctx context.Context, key string, appendScore bool) (string, error) {
 	var values []redis.Z
 	var err error
+	// One read of the endpoint and its neighbour, for the same reason as the
+	// initial placement: separate score and count reads race a dequeue.
 	if appendScore {
-		values, err = r.client.ZRevRangeWithScores(ctx, key, 0, 0).Result()
+		values, err = r.client.ZRevRangeWithScores(ctx, key, 0, 1).Result()
 	} else {
-		values, err = r.client.ZRangeWithScores(ctx, key, 0, 0).Result()
+		values, err = r.client.ZRangeWithScores(ctx, key, 0, 1).Result()
 	}
 	if err != nil {
 		return "", err
@@ -651,9 +653,7 @@ func (r *RDB) receiverTargetEndpointScore(ctx context.Context, key string, appen
 	if score != math.Trunc(score) || score < -receiverTargetMaximumQueueScore || score > receiverTargetMaximumQueueScore {
 		return "", fmt.Errorf("queue score exhausted")
 	}
-	raw := strconv.FormatInt(int64(score), 10)
-	count, err := r.client.ZCount(ctx, key, raw, raw).Result()
-	if err != nil || count != 1 {
+	if len(values) == 2 && values[1].Score == score {
 		return "", fmt.Errorf("queue score is not unique")
 	}
 	if appendScore {
