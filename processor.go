@@ -379,6 +379,12 @@ func (p *processor) archive(l *base.Lease, msg *base.TaskMessage, e error) {
 	ctx, cancel := context.WithDeadline(context.Background(), l.Deadline())
 	defer cancel()
 	err := p.broker.Archive(ctx, msg, e.Error())
+	if receiverTargetArchiveRefused(err) {
+		// A receiver-target task has no archived state. It is delivered again so
+		// its handler can finalize it; archiving it would only retry forever.
+		p.retry(l, msg, e, p.isFailureFunc(e))
+		return
+	}
 	if err != nil {
 		errMsg := fmt.Sprintf("Could not move task id=%s from %q to %q", msg.ID, base.ActiveKey(msg.Queue), base.ArchivedKey(msg.Queue))
 		p.logger.Warnf("%s; Will retry syncing", errMsg)
@@ -390,6 +396,12 @@ func (p *processor) archive(l *base.Lease, msg *base.TaskMessage, e error) {
 			deadline: l.Deadline(),
 		}
 	}
+}
+
+// receiverTargetArchiveRefused reports the broker's refusal to archive a task
+// marked with a receiver-target source.
+func receiverTargetArchiveRefused(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "RECEIVER TARGET ARCHIVE UNSUPPORTED")
 }
 
 // queues returns a list of queues to query.
