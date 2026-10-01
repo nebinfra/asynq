@@ -120,7 +120,14 @@ func (r *recoverer) retry(msg *base.TaskMessage, err error) {
 }
 
 func (r *recoverer) archive(msg *base.TaskMessage, err error) {
-	if err := r.broker.Archive(context.Background(), msg, err.Error()); err != nil {
-		r.logger.Warnf("recoverer: could not move task to archive: %v", err)
+	archiveErr := r.broker.Archive(context.Background(), msg, err.Error())
+	if receiverTargetArchiveRefused(archiveErr) {
+		// A receiver-target task has no archived state: deliver it again so its
+		// handler can finalize it instead of leaving it active forever.
+		r.retry(msg, err)
+		return
+	}
+	if archiveErr != nil {
+		r.logger.Warnf("recoverer: could not move task to archive: %v", archiveErr)
 	}
 }
