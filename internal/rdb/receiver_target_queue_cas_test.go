@@ -874,12 +874,36 @@ func TestReceiverTargetCapacityV2FamilyAndRefusalCoverage(t *testing.T) {
 			}
 		}
 	}
+	// addIssueSpend activates issueSpend on top of the admitted totals the
+	// caller already seeded: the live mgmt ledger after its 2026-10-03
+	// activation, which the queue ledger read refused as inventory-corrupt.
+	addIssueSpend := func(admittedRows, admittedBytes string) func(*testing.T, *RDB, [receiverTargetQueueKeyCount]string) {
+		return func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			t.Helper()
+			if err := r.client.HSet(t.Context(), keys[1], "issueSpend", "b3bf43b24a9cbd3eb7e10995a781becafd0e81bab7abe8daff5a0d714df5686f").Err(); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.client.HSet(t.Context(), keys[4], map[string]any{
+				"admitted.rows": admittedRows, "admitted.bytes": admittedBytes,
+				"issueSpend.rows": "0", "issueSpend.bytes": "0", "issueSpend.reservedBytes": "0",
+				"issueSpend.limitRows": "39936", "issueSpend.limitBytes": "8327080", "issueSpend.limitReservedBytes": "0",
+			}).Err(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
 	tests := []struct {
 		name   string
 		valid  bool
 		mutate func(*testing.T, *RDB, [receiverTargetQueueKeyCount]string)
 	}{
 		{name: "engineering outcome fixed family", valid: true, mutate: addEngineering},
+		{name: "issue spend fixed family", valid: true, mutate: addIssueSpend("440653", "490062066")},
+		{name: "all seven live families", valid: true, mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
+			addEngineering(t, r, keys)
+			addBlueprint("1", "1")(t, r, keys)
+			addIssueSpend("441421", "490928796")(t, r, keys)
+		}},
 		{name: "blueprint statistics shared family", valid: true, mutate: addBlueprint("1", "1")},
 		{name: "all six families", valid: true, mutate: func(t *testing.T, r *RDB, keys [receiverTargetQueueKeyCount]string) {
 			addEngineering(t, r, keys)
