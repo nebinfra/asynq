@@ -209,29 +209,46 @@ func receiverTargetScriptSources(t *testing.T, files map[string]*ast.File) map[s
 			return true
 		})
 	}
-	literals := make(map[string]string)
+	expressions := make(map[string]ast.Expr)
 	for _, file := range files {
 		for _, declaration := range file.Decls {
 			general, ok := declaration.(*ast.GenDecl)
-			if !ok {
+			if !ok || general.Tok != token.CONST {
 				continue
 			}
 			for _, specification := range general.Specs {
 				value, ok := specification.(*ast.ValueSpec)
-				if !ok || len(value.Names) != 1 || len(value.Values) != 1 {
-					continue
+				if ok && len(value.Names) == 1 && len(value.Values) == 1 {
+					expressions[value.Names[0].Name] = value.Values[0]
 				}
-				literal, ok := value.Values[0].(*ast.BasicLit)
-				if !ok || literal.Kind != token.STRING {
-					continue
-				}
-				decoded, err := strconv.Unquote(literal.Value)
+			}
+		}
+	}
+	var literal func(ast.Expr, int) string
+	literal = func(expr ast.Expr, depth int) string {
+		if depth > len(expressions)+1 {
+			t.Fatal("cyclic script constant")
+		}
+		switch v := expr.(type) {
+		case *ast.BasicLit:
+			if v.Kind == token.STRING {
+				text, err := strconv.Unquote(v.Value)
 				if err != nil {
 					t.Fatal(err)
 				}
-				literals[value.Names[0].Name] = decoded
+				return text
+			}
+		case *ast.Ident:
+			if value, ok := expressions[v.Name]; ok {
+				return literal(value, depth+1)
+			}
+		case *ast.BinaryExpr:
+			if v.Op == token.ADD {
+				return literal(v.X, depth+1) + literal(v.Y, depth+1)
 			}
 		}
+		t.Fatalf("script source is not a closed string constant: %T", expr)
+		return ""
 	}
 	scripts := make(map[string]string)
 	for _, file := range files {
@@ -249,18 +266,7 @@ func receiverTargetScriptSources(t *testing.T, files map[string]*ast.File) map[s
 				if !ok || len(call.Args) != 1 || !isRedisNewScript(call.Fun) {
 					continue
 				}
-				switch argument := call.Args[0].(type) {
-				case *ast.BasicLit:
-					scripts[value.Names[0].Name], _ = strconv.Unquote(argument.Value)
-				case *ast.Ident:
-					source, exists := literals[argument.Name]
-					if !exists {
-						t.Fatalf("script %s source is not a literal", value.Names[0].Name)
-					}
-					scripts[value.Names[0].Name] = source
-				default:
-					t.Fatalf("script %s source is not statically closed", value.Names[0].Name)
-				}
+				scripts[value.Names[0].Name] = literal(call.Args[0], 0)
 			}
 		}
 	}

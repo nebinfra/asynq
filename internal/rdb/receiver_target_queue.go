@@ -28,7 +28,32 @@ const (
 	receiverTargetQueueOperandCount = 20
 )
 
-var receiverTargetQueueCmd = redis.NewScript(receiverTargetQueueSource)
+// Complete the native mutation and its acknowledgement before another queue
+// reader can observe the published task. The generated kernel remains unchanged.
+const receiverTargetQueueAtomicSource = `
+local function transaction()
+` + receiverTargetQueueSource + `
+end
+if redis.call('EXISTS', KEYS[7]) ~= 0 then
+  if redis.call('EXISTS', KEYS[6]) ~= 0 then return {'refused','receipt-conflict'} end
+  ARGV[8] = 'finalize'
+  return transaction()
+end
+local result = transaction()
+if result[1] ~= 'ok' then return result end
+if result[4] == '1' then
+  ARGV[8] = 'finalize'
+  local finalized = transaction()
+  if finalized[1] == 'ok' then return finalized end
+end
+ARGV[8] = 'settle'
+local settled = transaction()
+if settled[1] ~= 'ok' then return settled end
+ARGV[8] = 'finalize'
+return transaction()
+`
+
+var receiverTargetQueueCmd = redis.NewScript(receiverTargetQueueAtomicSource)
 
 type receiverTargetTaskCASResult struct {
 	targetRevision string
@@ -95,22 +120,7 @@ func (r *RDB) EnqueueReceiverTarget(ctx context.Context, msg *base.TaskMessage, 
 }
 
 func (r *RDB) executeReceiverTargetTaskCAS(ctx context.Context, op errors.Op, keys [receiverTargetQueueKeyCount]string, operands [receiverTargetQueueOperandCount]string) error {
-	result, err := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
-	if err != nil {
-		return err
-	}
-	if result.replayed {
-		operands[7] = "finalize"
-		if _, finalizeErr := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands); finalizeErr == nil {
-			return nil
-		}
-	}
-	operands[7] = "settle"
-	if _, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands); err != nil {
-		return err
-	}
-	operands[7] = "finalize"
-	_, err = r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
+	_, err := r.applyReceiverTargetTaskCAS(ctx, op, keys, operands)
 	return err
 }
 
