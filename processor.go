@@ -42,6 +42,7 @@ type processor struct {
 	isFailureFunc     func(error) bool
 
 	errHandler      ErrorHandler
+	beforeArchive   func(context.Context, *Task, error) error
 	shutdownTimeout time.Duration
 
 	// channel via which to send sync requests to syncer.
@@ -85,6 +86,7 @@ type processorParams struct {
 	queues            map[string]int
 	strictPriority    bool
 	errHandler        ErrorHandler
+	beforeArchive     func(context.Context, *Task, error) error
 	shutdownTimeout   time.Duration
 	starting          chan<- *workerInfo
 	finished          chan<- *base.TaskMessage
@@ -115,6 +117,7 @@ func newProcessor(params processorParams) *processor {
 		quit:              make(chan struct{}),
 		abort:             make(chan struct{}),
 		errHandler:        params.errHandler,
+		beforeArchive:     params.beforeArchive,
 		handler:           HandlerFunc(func(ctx context.Context, t *Task) error { return fmt.Errorf("handler not set") }),
 		shutdownTimeout:   params.shutdownTimeout,
 		starting:          params.starting,
@@ -376,9 +379,26 @@ func (p *processor) archive(l *base.Lease, msg *base.TaskMessage, e error) {
 		// If lease is not valid, do not write to redis; Let recoverer take care of it.
 		return
 	}
-	ctx, cancel := context.WithDeadline(context.Background(), l.Deadline())
-	defer cancel()
-	err := p.broker.Archive(ctx, msg, e.Error())
+	archive := func() error {
+		if !l.IsValid() {
+			return ErrLeaseExpired
+		}
+		ctx, cancel := asynqcontext.New(p.baseCtxFn(), msg, l.Deadline())
+		defer cancel()
+		if p.beforeArchive != nil {
+			if err := p.beforeArchive(ctx, NewTaskWithHeaders(msg.Type, msg.Payload, msg.Headers), e); err != nil {
+				return err
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !l.IsValid() {
+			return ErrLeaseExpired
+		}
+		return p.broker.Archive(ctx, msg, e.Error())
+	}
+	err := archive()
 	if receiverTargetArchiveRefused(err) {
 		// A receiver-target task has no archived state. It is delivered again so
 		// its handler can finalize it; archiving it would only retry forever.
@@ -389,9 +409,7 @@ func (p *processor) archive(l *base.Lease, msg *base.TaskMessage, e error) {
 		errMsg := fmt.Sprintf("Could not move task id=%s from %q to %q", msg.ID, base.ActiveKey(msg.Queue), base.ArchivedKey(msg.Queue))
 		p.logger.Warnf("%s; Will retry syncing", errMsg)
 		p.syncRequestCh <- &syncRequest{
-			fn: func() error {
-				return p.broker.Archive(ctx, msg, e.Error())
-			},
+			fn:       archive,
 			errMsg:   errMsg,
 			deadline: l.Deadline(),
 		}

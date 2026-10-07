@@ -530,10 +530,9 @@ func TestProcessorWithExpiredLease(t *testing.T) {
 		{
 			pending: []*base.TaskMessage{m1},
 			handler: HandlerFunc(func(ctx context.Context, task *Task) error {
-				// make sure the task processing time exceeds lease duration
-				// to test expired lease.
-				time.Sleep(rdb.LeaseDuration + 10*time.Second)
-				return nil
+				// Lease expiry cancels this handler; finish before the next test.
+				<-ctx.Done()
+				return ctx.Err()
 			}),
 			wantErrCount: 1, // ErrorHandler should still be called with ErrLeaseExpired
 		},
