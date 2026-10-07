@@ -185,6 +185,12 @@ type Config struct {
 	//     ErrorHandler: asynq.ErrorHandlerFunc(reportError)
 	ErrorHandler ErrorHandler
 
+	// BeforeArchive runs before each attempt to archive a failed task.
+	// An error leaves the task with the existing synchronization and lease
+	// recovery machinery. It does not change the task's retry limit.
+	// The callback must be idempotent; broker failures can repeat it.
+	BeforeArchive func(context.Context, *Task, error) error
+
 	// Logger specifies the logger used by the server instance.
 	//
 	// If unset, default logger is used.
@@ -554,6 +560,7 @@ func NewServerFromRedisClient(c redis.UniversalClient, cfg Config) *Server {
 		queues:            queues,
 		strictPriority:    cfg.StrictPriority,
 		errHandler:        cfg.ErrorHandler,
+		beforeArchive:     cfg.BeforeArchive,
 		shutdownTimeout:   shutdownTimeout,
 		starting:          starting,
 		finished:          finished,
